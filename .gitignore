@@ -261,3 +261,8 @@ docs/.vitepress/dist/
 docs/.vitepress/cache/
 docs/en/awesome.md
 package-lock.json
+
+# Local runtime state
+.tmp/
+api_server.pid
+api_outputs/
