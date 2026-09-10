@@ -363,6 +363,39 @@ class RunBatchTests(unittest.TestCase):
         self.assertEqual("batch stalled", by_id["j1"]["error"])
         self.assertEqual("batch stalled before submission", by_id["j2"]["error"])
 
+    def test_completion_submits_the_next_job_without_waiting(self) -> None:
+        """A finished job must free the worker immediately, not after a poll interval."""
+
+        sleeps: list[float] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}', '{"id": "j2"}'])
+            args = build_args(jobs_path, tmp, max_inflight=1, poll_interval=2)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            succeeded, failed = run_batch(
+                FakeApi(), args, jobs, manifest, sleep=sleeps.append
+            )
+
+        self.assertEqual((2, 0), (succeeded, failed))
+        self.assertEqual([], sleeps)
+
+    def test_no_progress_still_waits_between_polls(self) -> None:
+        """Without a completion the runner must back off by the poll interval."""
+
+        sleeps: list[float] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            args = build_args(jobs_path, tmp, poll_interval=2)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            run_batch(FakeApi(polls_before_done=4), args, jobs, manifest, sleep=sleeps.append)
+
+        self.assertEqual([2.0, 2.0, 2.0], sleeps)
+
     def test_transient_poll_failure_is_retried(self) -> None:
         """A dropped connection while polling must not abort the batch."""
 

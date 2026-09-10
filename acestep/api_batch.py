@@ -173,6 +173,11 @@ def run_batch(
         append_manifest_row(manifest_path, {"id": job.job_id, "prompt": job.args.prompt, **row})
 
     while pending or inflight:
+        # Set whenever a job reaches a terminal state this cycle. A completion
+        # frees the server's worker, so the next job must be submitted at once
+        # instead of after another poll interval of idle GPU.
+        progressed = False
+
         while pending and len(inflight) < args.max_inflight:
             job = pending[0]
             try:
@@ -235,6 +240,7 @@ def run_batch(
 
                 del inflight[task_id]
                 last_completion = monotonic()
+                progressed = True
                 if status == 2:
                     failed += 1
                     record(job, {"task_id": task_id, "status": "failed", "error": f"task failed: {item}"})
@@ -263,7 +269,7 @@ def run_batch(
             print(f"[stalled] no job completed within {args.timeout}s, aborting batch")
             break
 
-        if pending or inflight:
+        if (pending or inflight) and not progressed:
             sleep(args.poll_interval)
 
     return succeeded, failed
