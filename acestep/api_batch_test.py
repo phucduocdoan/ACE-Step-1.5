@@ -513,10 +513,6 @@ class RunBatchTests(unittest.TestCase):
         self.assertEqual("batch stalled before submission", rows[0]["error"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ResultIntegrityTests(unittest.TestCase):
     """A job only counts as succeeded when it really produced audio."""
 
@@ -605,3 +601,7 @@ class ModuleEntryPointTests(unittest.TestCase):
         result = self._run_help("acestep.api_batch")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--jobs", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
