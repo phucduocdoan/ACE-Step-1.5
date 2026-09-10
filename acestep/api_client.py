@@ -158,6 +158,25 @@ def parse_query_result_item(item: dict[str, Any]) -> list[dict[str, Any]]:
     return parsed if isinstance(parsed, list) else []
 
 
+def query_tasks(
+    session: requests.Session,
+    base_url: str,
+    api_key: Optional[str],
+    task_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Query ``/query_result`` for one or more task IDs in a single request."""
+
+    response = session.post(
+        f"{base_url.rstrip('/')}/query_result",
+        headers={"Content-Type": "application/json", **build_headers(api_key)},
+        json={"task_id_list": list(task_ids)},
+        timeout=60,
+    )
+    response.raise_for_status()
+    body = response.json()
+    return (body or {}).get("data") or []
+
+
 def poll_task_result(
     session: requests.Session,
     base_url: str,
@@ -171,15 +190,7 @@ def poll_task_result(
     deadline = time.time() + timeout
     last_progress = None
     while time.time() < deadline:
-        response = session.post(
-            f"{base_url.rstrip('/')}/query_result",
-            headers={"Content-Type": "application/json", **build_headers(api_key)},
-            json={"task_id_list": [task_id]},
-            timeout=60,
-        )
-        response.raise_for_status()
-        body = response.json()
-        items = (body or {}).get("data") or []
+        items = query_tasks(session, base_url, api_key, [task_id])
         if not items:
             time.sleep(poll_interval)
             continue
@@ -217,7 +228,7 @@ def download_audio_files(
     base_url: str,
     audio_items: list[dict[str, Any]],
     output_dir: str,
-    task_id: str,
+    file_prefix: str,
 ) -> list[Path]:
     """Download generated audio files to the requested output directory."""
 
@@ -230,7 +241,7 @@ def download_audio_files(
             continue
         response = session.get(resolve_audio_url(base_url, file_url), timeout=300)
         response.raise_for_status()
-        output_path = out_dir / f"{task_id}_{index}{infer_output_suffix(file_url)}"
+        output_path = out_dir / f"{file_prefix}_{index}{infer_output_suffix(file_url)}"
         output_path.write_bytes(response.content)
         saved_paths.append(output_path)
     return saved_paths
@@ -272,7 +283,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     base_url=args.base_url,
                     audio_items=results,
                     output_dir=args.output_dir,
-                    task_id=task_id,
+                    file_prefix=task_id,
                 )
                 for path in saved:
                     print(f"saved: {path}")
