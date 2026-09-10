@@ -291,3 +291,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as exc:
         print(f"error: {exc}")
         return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

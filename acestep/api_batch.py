@@ -307,3 +307,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print(f"done: succeeded={succeeded} failed={failed} total={succeeded + failed}")
     return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

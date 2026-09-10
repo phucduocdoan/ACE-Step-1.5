@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from collections import deque
@@ -460,3 +462,25 @@ class RunBatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModuleEntryPointTests(unittest.TestCase):
+    """Both CLIs must be runnable as ``python -m``, not just importable."""
+
+    def _run_help(self, module: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", module, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def test_api_client_is_runnable_as_a_module(self):
+        result = self._run_help("acestep.api_client")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--base-url", result.stdout)
+
+    def test_api_batch_is_runnable_as_a_module(self):
+        result = self._run_help("acestep.api_batch")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--jobs", result.stdout)
