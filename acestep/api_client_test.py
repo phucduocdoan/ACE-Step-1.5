@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Optional
+
+import requests
 
 from acestep.api_client import (
     build_release_task_payload,
@@ -14,7 +17,9 @@ from acestep.api_client import (
     infer_output_suffix,
     parse_query_result_item,
     poll_task_result,
+    query_tasks,
     resolve_audio_url,
+    submit_generation_task,
     validate_args,
 )
 
@@ -144,25 +149,47 @@ class ApiClientResultParsingTests(unittest.TestCase):
 class _FakeResponse:
     """Minimal stand-in for a ``requests`` response object."""
 
-    def __init__(self, payload=None, content: bytes = b"") -> None:
+    def __init__(
+        self,
+        payload=None,
+        content: bytes = b"",
+        status_code: int = 200,
+        json_error: Optional[Exception] = None,
+    ) -> None:
         self._payload = payload
         self.content = content
+        self.status_code = status_code
+        self._json_error = json_error
 
     def raise_for_status(self) -> None:
-        """No-op: these tests never exercise an error status."""
+        """Raise for error status codes the way ``requests`` does."""
+
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}", response=self)
 
     def json(self):
-        """Return the canned JSON payload."""
+        """Return the canned JSON payload, or raise a canned decode error."""
 
+        if self._json_error is not None:
+            raise self._json_error
         return self._payload
 
 
 class _FakeDownloadSession:
     """Serves a fake audio GET for ``download_audio_files`` tests."""
 
-    def get(self, url: str, **kwargs) -> _FakeResponse:
-        """Return canned audio bytes regardless of the requested URL."""
+    def __init__(self, responses: Optional[list] = None) -> None:
+        self.urls: list[str] = []
+        # Canned responses returned in order; falls back to a fixed success
+        # response when not given, matching the previous unconditional behaviour.
+        self.responses = list(responses) if responses is not None else None
 
+    def get(self, url: str, **kwargs) -> _FakeResponse:
+        """Record the requested URL and return a canned (or default) response."""
+
+        self.urls.append(url)
+        if self.responses is not None:
+            return self.responses.pop(0)
         return _FakeResponse(content=b"audio-bytes")
 
 
@@ -184,6 +211,169 @@ class DownloadAudioFilesTests(unittest.TestCase):
 
         self.assertEqual(1, len(saved))
         self.assertEqual(out_dir, saved[0].parent)
+
+
+class DownloadAudioFilesUrlAndSuffixTests(unittest.TestCase):
+    """The download path must resolve each item's URL and index filenames correctly."""
+
+    def test_relative_file_urls_resolve_against_base_url(self) -> None:
+        """The GET must hit the base URL joined with the item's relative file URL."""
+
+        session = _FakeDownloadSession()
+        with tempfile.TemporaryDirectory() as tmp:
+            download_audio_files(
+                session=session,
+                base_url="http://127.0.0.1:8001",
+                audio_items=[{"file": "/v1/audio?path=%2Ftmp%2Fa.mp3"}],
+                output_dir=tmp,
+                file_prefix="job",
+            )
+
+        self.assertEqual(["http://127.0.0.1:8001/v1/audio?path=%2Ftmp%2Fa.mp3"], session.urls)
+
+    def test_items_missing_a_file_field_are_skipped_but_still_consume_an_index(self) -> None:
+        """A skipped item must not shift the index used by later filenames.
+
+        The output index comes from ``enumerate(audio_items)``, not from a count
+        of files actually downloaded, so a blank entry ahead of a real one must
+        leave that real file numbered by its original position.
+        """
+
+        session = _FakeDownloadSession()
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = download_audio_files(
+                session=session,
+                base_url="http://127.0.0.1:8001",
+                audio_items=[{"file": ""}, {"file": "/v1/audio?path=%2Ftmp%2Fb.flac"}],
+                output_dir=tmp,
+                file_prefix="job",
+            )
+
+        self.assertEqual(1, len(saved))
+        self.assertEqual("job_1.flac", saved[0].name)
+
+    def test_http_error_status_propagates_from_the_download(self) -> None:
+        """A failed audio download must raise, not silently write an empty file."""
+
+        session = _FakeDownloadSession(responses=[_FakeResponse(status_code=500)])
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(requests.HTTPError):
+                download_audio_files(
+                    session=session,
+                    base_url="http://127.0.0.1:8001",
+                    audio_items=[{"file": "/v1/audio?path=%2Ftmp%2Fa.mp3"}],
+                    output_dir=tmp,
+                    file_prefix="job",
+                )
+
+
+class _FakeApiSession:
+    """Serves canned POST responses in order, for submit/query error-path tests.
+
+    Mirrors ``_FakePollSession``'s indexing: the last response repeats once
+    the list is exhausted, so a single-entry list is enough for tests that
+    only ever make one call.
+    """
+
+    def __init__(self, responses: list) -> None:
+        self.responses = list(responses)
+        self.calls = 0
+
+    def post(self, url: str, **kwargs) -> _FakeResponse:
+        """Return the next canned response, repeating the last one after exhaustion."""
+
+        response = self.responses[min(self.calls, len(self.responses) - 1)]
+        self.calls += 1
+        return response
+
+
+class SubmitGenerationTaskTests(unittest.TestCase):
+    """Exercise the ``/release_task`` submission helper's response handling."""
+
+    def test_raises_for_http_error_status(self) -> None:
+        """A 5xx response must surface as an ``HTTPError``, not a swallowed failure."""
+
+        session = _FakeApiSession([_FakeResponse(status_code=500)])
+        with self.assertRaises(requests.HTTPError):
+            submit_generation_task(
+                session=session,
+                base_url="http://127.0.0.1:8001",
+                api_key=None,
+                payload={"task_type": "text2music"},
+            )
+
+    def test_raises_when_body_is_not_json(self) -> None:
+        """A non-JSON body must propagate the decode error, not be misread as empty."""
+
+        session = _FakeApiSession(
+            [_FakeResponse(json_error=json.JSONDecodeError("Expecting value", "", 0))]
+        )
+        with self.assertRaises(json.JSONDecodeError):
+            submit_generation_task(
+                session=session,
+                base_url="http://127.0.0.1:8001",
+                api_key=None,
+                payload={"task_type": "text2music"},
+            )
+
+    def test_raises_when_response_has_no_task_id(self) -> None:
+        """A 200 response missing ``data.task_id`` must fail loudly, not return ``None``."""
+
+        session = _FakeApiSession([_FakeResponse({"data": {}})])
+        with self.assertRaisesRegex(RuntimeError, "did not return a task_id"):
+            submit_generation_task(
+                session=session,
+                base_url="http://127.0.0.1:8001",
+                api_key=None,
+                payload={"task_type": "text2music"},
+            )
+
+    def test_returns_task_id_on_success(self) -> None:
+        """A well-formed response must yield the queued task ID."""
+
+        session = _FakeApiSession([_FakeResponse({"data": {"task_id": "t-123"}})])
+        task_id = submit_generation_task(
+            session=session,
+            base_url="http://127.0.0.1:8001",
+            api_key=None,
+            payload={"task_type": "text2music"},
+        )
+
+        self.assertEqual("t-123", task_id)
+
+
+class QueryTasksTests(unittest.TestCase):
+    """Exercise the ``/query_result`` polling helper's response handling."""
+
+    def test_raises_for_http_error_status(self) -> None:
+        """A 5xx response must surface as an ``HTTPError``."""
+
+        session = _FakeApiSession([_FakeResponse(status_code=503)])
+        with self.assertRaises(requests.HTTPError):
+            query_tasks(session, "http://127.0.0.1:8001", None, ["t1"])
+
+    def test_raises_when_body_is_not_json(self) -> None:
+        """A non-JSON body must propagate the decode error."""
+
+        session = _FakeApiSession(
+            [_FakeResponse(json_error=json.JSONDecodeError("Expecting value", "", 0))]
+        )
+        with self.assertRaises(json.JSONDecodeError):
+            query_tasks(session, "http://127.0.0.1:8001", None, ["t1"])
+
+    def test_missing_data_field_returns_empty_list(self) -> None:
+        """A response with no ``data`` field must yield ``[]``, not raise."""
+
+        session = _FakeApiSession([_FakeResponse({"code": 0})])
+        self.assertEqual([], query_tasks(session, "http://127.0.0.1:8001", None, ["t1"]))
+
+    def test_returns_data_list_on_success(self) -> None:
+        """A well-formed response must yield the ``data`` list unchanged."""
+
+        session = _FakeApiSession([_FakeResponse({"data": [{"task_id": "t1", "status": 1}]})])
+        result = query_tasks(session, "http://127.0.0.1:8001", None, ["t1"])
+
+        self.assertEqual([{"task_id": "t1", "status": 1}], result)
 
 
 class _FakePollSession:
@@ -265,6 +455,21 @@ class PollTaskResultTests(unittest.TestCase):
             )
 
         self.assertEqual(3, session.calls)
+
+    def test_raises_on_task_failure_status(self) -> None:
+        """Status 2 (failed) must raise, not be treated as still pending."""
+
+        with self.assertRaisesRegex(RuntimeError, "task failed"):
+            poll_task_result(
+                session=_FakePollSession([2]),
+                base_url="http://127.0.0.1:8001",
+                api_key=None,
+                task_id="t1",
+                poll_interval=1.0,
+                timeout=10.0,
+                sleep=lambda _: None,
+                monotonic=lambda: 0.0,
+            )
 
 
 if __name__ == "__main__":

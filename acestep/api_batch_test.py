@@ -891,6 +891,137 @@ class AuthenticationTests(unittest.TestCase):
         self.assertEqual(1, api.download_count)
 
 
+class MainResumeTests(unittest.TestCase):
+    """``main`` must honour manifest-driven resume, not just ``run_batch``."""
+
+    def test_resume_skips_job_already_recorded_succeeded(self) -> None:
+        """A manifest row with status succeeded must stop ``main`` from resubmitting that job."""
+
+        api = FakeApi()
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1", "prompt": "a"}', '{"id": "j2", "prompt": "b"}'])
+            manifest_path = Path(tmp) / "manifest.jsonl"
+            manifest_path.write_text('{"id": "j1", "status": "succeeded"}\n', encoding="utf-8")
+
+            buffer = io.StringIO()
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api), redirect_stdout(buffer):
+                exit_code = main([
+                    "--jobs", jobs_path,
+                    "--output-dir", tmp,
+                    "--manifest", str(manifest_path),
+                    "--poll-interval", "0.001",
+                ])
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(["task-1"], api.submitted)
+        self.assertIn("resume: skipping 1 job(s) already succeeded", buffer.getvalue())
+
+    def test_no_resume_reruns_a_job_already_recorded_succeeded(self) -> None:
+        """``--no-resume`` must ignore the manifest and resubmit every job."""
+
+        api = FakeApi()
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1", "prompt": "a"}', '{"id": "j2", "prompt": "b"}'])
+            manifest_path = Path(tmp) / "manifest.jsonl"
+            manifest_path.write_text('{"id": "j1", "status": "succeeded"}\n', encoding="utf-8")
+
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api):
+                exit_code = main([
+                    "--jobs", jobs_path,
+                    "--output-dir", tmp,
+                    "--manifest", str(manifest_path),
+                    "--poll-interval", "0.001",
+                    "--no-resume",
+                ])
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(2, len(api.submitted))
+
+    def test_resume_skips_entire_batch_when_all_jobs_already_succeeded(self) -> None:
+        """When resume leaves nothing to do, ``main`` must report that and not touch the session."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1", "prompt": "a"}'])
+            manifest_path = Path(tmp) / "manifest.jsonl"
+            manifest_path.write_text('{"id": "j1", "status": "succeeded"}\n', encoding="utf-8")
+
+            buffer = io.StringIO()
+            # Nothing should reach the session, but assert that against a FakeApi
+            # rather than leaving it unpatched or using a MagicMock. Unpatched, a
+            # regression fires real HTTP at whatever is listening on the default
+            # base URL; a MagicMock never returns a terminal status, so the poll
+            # loop spins until the stall timeout instead of failing.
+            api = FakeApi()
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api), redirect_stdout(buffer):
+                exit_code = main([
+                    "--jobs", jobs_path,
+                    "--output-dir", tmp,
+                    "--manifest", str(manifest_path),
+                    "--poll-interval", "0.001",
+                ])
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("nothing to do", buffer.getvalue())
+        self.assertEqual([], api.submitted)
+
+
+class MainDefaultManifestPathTests(unittest.TestCase):
+    """Without ``--manifest``, ``main`` must default to ``<output-dir>/manifest.jsonl``."""
+
+    def test_default_manifest_path_is_output_dir_manifest_jsonl(self) -> None:
+        """The manifest must land under ``--output-dir``, not the current directory."""
+
+        api = FakeApi()
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api):
+                exit_code = main(["--jobs", jobs_path, "--output-dir", tmp, "--poll-interval", "0.001"])
+            expected_manifest = Path(tmp) / "manifest.jsonl"
+            manifest_exists = expected_manifest.exists()
+            rows = read_manifest(expected_manifest) if manifest_exists else []
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(manifest_exists)
+        self.assertEqual("succeeded", rows[0]["status"])
+
+
+class MainMaxInflightValidationTests(unittest.TestCase):
+    """``main`` must reject a non-positive ``--max-inflight`` before submitting anything."""
+
+    def test_max_inflight_zero_is_rejected_with_a_clean_error(self) -> None:
+        """A zero max-inflight must fail with the documented message and exit code, no traceback."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = main([
+                    "--jobs", jobs_path,
+                    "--output-dir", tmp,
+                    "--poll-interval", "0.001",
+                    "--max-inflight", "0",
+                ])
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("--max-inflight must be >= 1", buffer.getvalue())
+
+
+class MainMissingJobsFileTests(unittest.TestCase):
+    """A nonexistent jobs file must produce a clean error, not a traceback."""
+
+    def test_missing_jobs_file_reports_clean_error_and_exit_code_1(self) -> None:
+        """Reading a jobs file that does not exist must be caught and reported, not raised."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing_path = str(Path(tmp) / "nope.jsonl")
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = main(["--jobs", missing_path, "--output-dir", tmp, "--poll-interval", "0.001"])
+
+        self.assertEqual(1, exit_code)
+        self.assertTrue(buffer.getvalue().startswith("error:"))
+
+
 class ModuleEntryPointTests(unittest.TestCase):
     """Both CLIs must be runnable as ``python -m``, not just importable."""
 
