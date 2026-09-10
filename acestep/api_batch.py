@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from collections import deque
@@ -14,6 +15,7 @@ import requests
 
 from acestep.api_client import (
     build_arg_parser,
+    build_headers,
     build_release_task_payload,
     download_audio_files,
     parse_query_result_item,
@@ -67,6 +69,25 @@ def build_batch_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def auto_job_id(overrides: dict[str, Any], taken: set[str]) -> str:
+    """Derive a job ID from the entry's own fields when it declares no ``id``.
+
+    Resume matches on the job ID, so a positional ID (``job-0003``) would rebind
+    to a different line as soon as the jobs file is edited, silently skipping a
+    job that never ran. Hashing the entry keeps the ID attached to its content.
+    """
+
+    canonical = json.dumps(overrides, sort_keys=True, ensure_ascii=False)
+    base = f"job-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:8]}"
+    if base not in taken:
+        return base
+    # Byte-identical job lines are legitimate; number them deterministically.
+    suffix = 2
+    while f"{base}-{suffix}" in taken:
+        suffix += 1
+    return f"{base}-{suffix}"
+
+
 def load_jobs(jobs_path: str, defaults: argparse.Namespace) -> list[Job]:
     """Read a JSONL job file, layering each entry over the CLI defaults."""
 
@@ -86,9 +107,10 @@ def load_jobs(jobs_path: str, defaults: argparse.Namespace) -> list[Job]:
             raise ValueError(f"{jobs_path}:{line_number}: each job line must be a JSON object")
 
         overrides = dict(entry)
-        job_id = str(overrides.pop("id", "") or "").strip() or f"job-{len(jobs) + 1:04d}"
-        if job_id in seen:
-            raise ValueError(f"{jobs_path}:{line_number}: duplicate job id '{job_id}'")
+        explicit_id = str(overrides.pop("id", "") or "").strip()
+        if explicit_id and explicit_id in seen:
+            raise ValueError(f"{jobs_path}:{line_number}: duplicate job id '{explicit_id}'")
+        job_id = explicit_id or auto_job_id(overrides, seen)
         unknown = sorted(set(overrides) - allowed)
         if unknown:
             raise ValueError(
@@ -142,7 +164,7 @@ def _collect_job_files(
     """Download a finished job's audio, or list its URLs when downloads are off."""
 
     if args.no_download:
-        return [str(item.get("file", "")) for item in audio_items]
+        return [str(item["file"]) for item in audio_items if str(item.get("file", "")).strip()]
     saved = download_audio_files(
         session=session,
         base_url=args.base_url,
@@ -241,10 +263,12 @@ def run_batch(
                 del inflight[task_id]
                 last_completion = monotonic()
                 progressed = True
-                if status == 2:
+                if status != 1:
+                    # Anything that is neither pending (0) nor success (1) is a
+                    # failure, including statuses this client does not know yet.
                     failed += 1
                     record(job, {"task_id": task_id, "status": "failed", "error": f"task failed: {item}"})
-                    print(f"[failed] {job.job_id}: task failed")
+                    print(f"[failed] {job.job_id}: task failed (status {status})")
                     continue
 
                 try:
@@ -253,6 +277,22 @@ def run_batch(
                     failed += 1
                     record(job, {"task_id": task_id, "status": "failed", "error": f"download failed: {exc}"})
                     print(f"[failed] {job.job_id}: download failed: {exc}")
+                    continue
+
+                if not files:
+                    # The server reports success with a placeholder empty result
+                    # when it produced no audio. Recording that as succeeded
+                    # would make resume skip the job forever.
+                    failed += 1
+                    record(
+                        job,
+                        {
+                            "task_id": task_id,
+                            "status": "failed",
+                            "error": "task succeeded but returned no audio",
+                        },
+                    )
+                    print(f"[failed] {job.job_id}: task returned no audio")
                     continue
 
                 succeeded += 1
@@ -303,6 +343,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print(f"running {len(jobs)} job(s), max inflight {args.max_inflight}, manifest {manifest_path}")
     with requests.Session() as session:
+        # GET /v1/audio is auth-gated too, and download_audio_files does not
+        # build per-request headers, so authenticate the session itself.
+        session.headers.update(build_headers(args.api_key))
         succeeded, failed = run_batch(session, args, jobs, manifest_path)
 
     print(f"done: succeeded={succeeded} failed={failed} total={succeeded + failed}")

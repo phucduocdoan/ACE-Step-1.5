@@ -256,6 +256,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         validate_args(args)
         payload = build_release_task_payload(args)
         with requests.Session() as session:
+            # GET /v1/audio is auth-gated too, and download_audio_files does not
+            # build per-request headers, so authenticate the session itself.
+            session.headers.update(build_headers(args.api_key))
             task_id = submit_generation_task(
                 session=session,
                 base_url=args.base_url,

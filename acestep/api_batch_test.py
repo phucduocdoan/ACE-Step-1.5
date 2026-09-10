@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
+from unittest import mock
 
 import requests
 
@@ -16,6 +17,7 @@ from acestep.api_batch import (
     build_batch_arg_parser,
     load_completed_job_ids,
     load_jobs,
+    main,
     run_batch,
 )
 
@@ -50,17 +52,32 @@ class FakeApi:
         submit_status_codes=(),
         submit_connection_errors: int = 0,
         poll_connection_errors: int = 0,
+        empty_result_task_ids=(),
+        unknown_status_task_ids=(),
     ) -> None:
         self.polls_before_done = polls_before_done
         self.fail_task_ids = set(fail_task_ids)
         self.submit_status_codes = deque(submit_status_codes)
         self.submit_connection_errors = submit_connection_errors
         self.poll_connection_errors = poll_connection_errors
+        self.empty_result_task_ids = set(empty_result_task_ids)
+        self.unknown_status_task_ids = set(unknown_status_task_ids)
+        self.headers: dict[str, str] = {}
         self.submitted: list[str] = []
         self.polls: dict[str, int] = {}
         self.inflight = 0
         self.max_inflight_seen = 0
         self.download_count = 0
+
+    def __enter__(self) -> "FakeApi":
+        """Support the ``with requests.Session()`` idiom."""
+
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        """Support the ``with requests.Session()`` idiom."""
+
+        return None
 
     def post(self, url: str, **kwargs) -> FakeResponse:
         """Route a POST to the fake release-task or query-result handler."""
@@ -110,6 +127,14 @@ class FakeApi:
             if task_id in self.fail_task_ids:
                 items.append({"task_id": task_id, "status": 2, "result": "[]"})
                 continue
+            if task_id in self.unknown_status_task_ids:
+                items.append({"task_id": task_id, "status": 3, "result": "[]"})
+                continue
+            if task_id in self.empty_result_task_ids:
+                # What the server really sends when it succeeds with no audio.
+                placeholder = json.dumps([{"file": "", "wave": "", "status": 1}])
+                items.append({"task_id": task_id, "status": 1, "result": placeholder})
+                continue
             result = json.dumps([{"file": f"/v1/audio?path=%2Ftmp%2F{task_id}.mp3", "status": 1}])
             items.append({"task_id": task_id, "status": 1, "result": result})
         return FakeResponse({"data": items})
@@ -158,12 +183,40 @@ class LoadJobsTests(unittest.TestCase):
             args = build_args(jobs_path, tmp, inference_steps=12)
             jobs = load_jobs(jobs_path, args)
 
-        self.assertEqual(["song-01", "job-0002"], [job.job_id for job in jobs])
+        self.assertEqual("song-01", jobs[0].job_id)
+        self.assertTrue(jobs[1].job_id.startswith("job-"))
         self.assertEqual("lofi", jobs[0].args.prompt)
         self.assertEqual(45, jobs[0].args.audio_duration)
         self.assertEqual(12, jobs[0].args.inference_steps)
         self.assertEqual(12, jobs[1].args.inference_steps)
         self.assertIsNone(jobs[1].args.audio_duration)
+
+    def test_auto_ids_survive_editing_the_jobs_file(self) -> None:
+        """An auto ID must follow its job line, not the line's position."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            before = write_jobs_file(tmp, [
+                '{"prompt": "lofi"}',
+                '{"prompt": "bolero"}',
+            ])
+            first = load_jobs(before, build_args(before, tmp))
+            after = write_jobs_file(tmp, ['{"prompt": "bolero"}'])
+            second = load_jobs(after, build_args(after, tmp))
+
+        self.assertEqual(first[1].job_id, second[0].job_id)
+        self.assertNotEqual(first[0].job_id, first[1].job_id)
+
+    def test_identical_job_lines_get_distinct_ids(self) -> None:
+        """Duplicate lines are legitimate and must not collide."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, [
+                '{"prompt": "lofi"}',
+                '{"prompt": "lofi"}',
+            ])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp))
+
+        self.assertEqual(2, len(set(job.job_id for job in jobs)))
 
     def test_invalid_json_reports_line_number(self) -> None:
         """A malformed line should name the file and line number."""
@@ -462,6 +515,74 @@ class RunBatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResultIntegrityTests(unittest.TestCase):
+    """A job only counts as succeeded when it really produced audio."""
+
+    def _run_one(self, **api_kwargs) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            args = build_args(jobs_path, tmp)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+            counts = run_batch(FakeApi(**api_kwargs), args, jobs, manifest, sleep=lambda _: None)
+            rows = read_manifest(manifest)
+        return {"counts": counts, "row": rows[0]}
+
+    def test_success_without_audio_is_recorded_as_failed(self) -> None:
+        """An empty result list must not be resumed away as a success."""
+
+        outcome = self._run_one(empty_result_task_ids={"task-1"})
+        self.assertEqual((0, 1), outcome["counts"])
+        self.assertEqual("failed", outcome["row"]["status"])
+        self.assertIn("no audio", outcome["row"]["error"])
+
+    def test_unknown_status_is_recorded_as_failed(self) -> None:
+        """A status this client does not know is a failure, not a success."""
+
+        outcome = self._run_one(unknown_status_task_ids={"task-1"})
+        self.assertEqual((0, 1), outcome["counts"])
+        self.assertEqual("failed", outcome["row"]["status"])
+
+    def test_no_download_mode_drops_placeholder_entries(self) -> None:
+        """``--no-download`` must not report an empty file URL as a result."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            args = build_args(jobs_path, tmp)
+            args.no_download = True
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+            counts = run_batch(
+                FakeApi(empty_result_task_ids={"task-1"}), args, jobs, manifest, sleep=lambda _: None
+            )
+            row = read_manifest(manifest)[0]
+
+        self.assertEqual((0, 1), counts)
+        self.assertEqual("failed", row["status"])
+
+
+class AuthenticationTests(unittest.TestCase):
+    """``--api-key`` must reach every request, downloads included."""
+
+    def test_api_key_authenticates_the_whole_session(self) -> None:
+        """``GET /v1/audio`` is auth-gated, so the session must carry the key."""
+
+        api = FakeApi()
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api):
+                exit_code = main([
+                    "--jobs", jobs_path,
+                    "--output-dir", tmp,
+                    "--poll-interval", "0",
+                    "--api-key", "sk-test",
+                ])
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual("Bearer sk-test", api.headers.get("Authorization"))
+        self.assertEqual(1, api.download_count)
 
 
 class ModuleEntryPointTests(unittest.TestCase):
