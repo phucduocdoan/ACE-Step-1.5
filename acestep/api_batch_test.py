@@ -41,10 +41,19 @@ class FakeResponse:
 class FakeApi:
     """In-memory stand-in for ``/release_task``, ``/query_result`` and audio downloads."""
 
-    def __init__(self, polls_before_done: int = 1, fail_task_ids=(), submit_status_codes=()) -> None:
+    def __init__(
+        self,
+        polls_before_done: int = 1,
+        fail_task_ids=(),
+        submit_status_codes=(),
+        submit_connection_errors: int = 0,
+        poll_connection_errors: int = 0,
+    ) -> None:
         self.polls_before_done = polls_before_done
         self.fail_task_ids = set(fail_task_ids)
         self.submit_status_codes = deque(submit_status_codes)
+        self.submit_connection_errors = submit_connection_errors
+        self.poll_connection_errors = poll_connection_errors
         self.submitted: list[str] = []
         self.polls: dict[str, int] = {}
         self.inflight = 0
@@ -69,6 +78,9 @@ class FakeApi:
     def _release_task(self) -> FakeResponse:
         """Queue one task, honouring any scripted error status codes."""
 
+        if self.submit_connection_errors:
+            self.submit_connection_errors -= 1
+            raise requests.ConnectionError("connection reset by peer")
         if self.submit_status_codes:
             status_code = self.submit_status_codes.popleft()
             if status_code >= 400:
@@ -83,6 +95,9 @@ class FakeApi:
     def _query_result(self, task_ids: list[str]) -> FakeResponse:
         """Report one item per queried task, finishing after enough polls."""
 
+        if self.poll_connection_errors:
+            self.poll_connection_errors -= 1
+            raise requests.ConnectionError("connection reset by peer")
         items = []
         for task_id in task_ids:
             self.polls[task_id] = self.polls.get(task_id, 0) + 1
@@ -347,6 +362,67 @@ class RunBatchTests(unittest.TestCase):
         self.assertEqual((0, 2), (succeeded, failed))
         self.assertEqual("batch stalled", by_id["j1"]["error"])
         self.assertEqual("batch stalled before submission", by_id["j2"]["error"])
+
+    def test_transient_poll_failure_is_retried(self) -> None:
+        """A dropped connection while polling must not abort the batch."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            args = build_args(jobs_path, tmp)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            succeeded, failed = run_batch(
+                FakeApi(poll_connection_errors=3), args, jobs, manifest, sleep=lambda _: None
+            )
+            rows = read_manifest(manifest)
+
+        self.assertEqual((1, 0), (succeeded, failed))
+        self.assertEqual("succeeded", rows[0]["status"])
+
+    def test_transient_submit_failure_is_retried(self) -> None:
+        """A dropped connection while submitting must not fail the job."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            args = build_args(jobs_path, tmp)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            api = FakeApi(submit_connection_errors=2)
+            succeeded, failed = run_batch(api, args, jobs, manifest, sleep=lambda _: None)
+            rows = read_manifest(manifest)
+
+        self.assertEqual((1, 0), (succeeded, failed))
+        self.assertEqual(["task-1"], api.submitted)
+        self.assertEqual("succeeded", rows[0]["status"])
+
+    def test_unreachable_server_stops_at_the_stall_timeout(self) -> None:
+        """Retrying an unreachable server must stay bounded by --timeout."""
+
+        clock = [0.0]
+
+        def fake_sleep(seconds: float) -> None:
+            clock[0] += max(seconds, 1.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            args = build_args(jobs_path, tmp, timeout=5)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            succeeded, failed = run_batch(
+                FakeApi(submit_connection_errors=10**6),
+                args,
+                jobs,
+                manifest,
+                sleep=fake_sleep,
+                monotonic=lambda: clock[0],
+            )
+            rows = read_manifest(manifest)
+
+        self.assertEqual((0, 1), (succeeded, failed))
+        self.assertEqual("batch stalled before submission", rows[0]["error"])
 
 
 if __name__ == "__main__":

@@ -201,6 +201,9 @@ def run_batch(
                 record(job, {"status": "failed", "error": f"submit failed: {exc}"})
                 print(f"[failed] {job.job_id}: submit failed: {exc}")
                 continue
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                print(f"[warn] {job.job_id}: submit unreachable, retrying: {exc}")
+                break
             except Exception as exc:
                 pending.popleft()
                 failed += 1
@@ -212,38 +215,43 @@ def run_batch(
             inflight[task_id] = job
             print(f"[submit] {job.job_id} -> {task_id} (inflight {len(inflight)}, pending {len(pending)})")
 
-        if not inflight:
-            sleep(args.poll_interval)
-            continue
-
-        for item in query_tasks(session, args.base_url, args.api_key, list(inflight)):
-            task_id = str(item.get("task_id", ""))
-            job = inflight.get(task_id)
-            if job is None:
-                continue
-            status = int(item.get("status", 0))
-            if status == 0:
-                continue
-
-            del inflight[task_id]
-            last_completion = monotonic()
-            if status == 2:
-                failed += 1
-                record(job, {"task_id": task_id, "status": "failed", "error": f"task failed: {item}"})
-                print(f"[failed] {job.job_id}: task failed")
-                continue
-
+        if inflight:
             try:
-                files = _collect_job_files(session, args, job, parse_query_result_item(item))
-            except Exception as exc:
-                failed += 1
-                record(job, {"task_id": task_id, "status": "failed", "error": f"download failed: {exc}"})
-                print(f"[failed] {job.job_id}: download failed: {exc}")
-                continue
+                items = query_tasks(session, args.base_url, args.api_key, list(inflight))
+            except requests.RequestException as exc:
+                # A dropped connection is routine while the server is busy loading
+                # models; the stall timeout below bounds how long we keep retrying.
+                print(f"[warn] poll failed, retrying: {exc}")
+                items = []
 
-            succeeded += 1
-            record(job, {"task_id": task_id, "status": "succeeded", "files": files})
-            print(f"[done] {job.job_id}: {len(files)} file(s)")
+            for item in items:
+                task_id = str(item.get("task_id", ""))
+                job = inflight.get(task_id)
+                if job is None:
+                    continue
+                status = int(item.get("status", 0))
+                if status == 0:
+                    continue
+
+                del inflight[task_id]
+                last_completion = monotonic()
+                if status == 2:
+                    failed += 1
+                    record(job, {"task_id": task_id, "status": "failed", "error": f"task failed: {item}"})
+                    print(f"[failed] {job.job_id}: task failed")
+                    continue
+
+                try:
+                    files = _collect_job_files(session, args, job, parse_query_result_item(item))
+                except Exception as exc:
+                    failed += 1
+                    record(job, {"task_id": task_id, "status": "failed", "error": f"download failed: {exc}"})
+                    print(f"[failed] {job.job_id}: download failed: {exc}")
+                    continue
+
+                succeeded += 1
+                record(job, {"task_id": task_id, "status": "succeeded", "files": files})
+                print(f"[done] {job.job_id}: {len(files)} file(s)")
 
         if monotonic() - last_completion > args.timeout:
             for task_id, job in inflight.items():
