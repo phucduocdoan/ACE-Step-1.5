@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Server settings
 HOST="127.0.0.1"
 # HOST="0.0.0.0"
-PORT=8001
+PORT="${PORT:-8001}"
 
 # API key for authentication (optional)
 API_KEY=""
@@ -38,7 +38,7 @@ LM_MODEL_PATH=""
 # LM_MODEL_PATH="--lm-model-path acestep-5Hz-lm-0.6B"
 
 # Update check on startup (set to "false" to disable)
-CHECK_UPDATE="true"
+CHECK_UPDATE="${CHECK_UPDATE:-true}"
 # CHECK_UPDATE="false"
 
 # Skip model loading at startup (models will be lazy-loaded on first request)
@@ -46,7 +46,41 @@ CHECK_UPDATE="true"
 # export ACESTEP_NO_INIT=false
 # export ACESTEP_NO_INIT=true
 
+# Runtime temp directory
+: "${ACESTEP_TMP_DIR:=${SCRIPT_DIR}/.tmp}"
+
 # ==================== Launch ====================
+
+_kill_processes_on_port() {
+    local port="$1"
+    local pids=""
+
+    if command -v lsof &>/dev/null; then
+        pids="$(lsof -ti "tcp:${port}" 2>/dev/null || true)"
+    elif command -v fuser &>/dev/null; then
+        pids="$(fuser "${port}/tcp" 2>/dev/null || true)"
+    fi
+
+    [[ -z "${pids// }" ]] && return 0
+
+    echo "[Port] Releasing port ${port} from existing process(es): ${pids}"
+    kill $pids 2>/dev/null || true
+
+    for _ in {1..10}; do
+        sleep 1
+        if command -v lsof &>/dev/null; then
+            pids="$(lsof -ti "tcp:${port}" 2>/dev/null || true)"
+        elif command -v fuser &>/dev/null; then
+            pids="$(fuser "${port}/tcp" 2>/dev/null || true)"
+        else
+            pids=""
+        fi
+        [[ -z "${pids// }" ]] && return 0
+    done
+
+    echo "[Port] Force killing stubborn process(es) on port ${port}: ${pids}"
+    kill -9 $pids 2>/dev/null || true
+}
 
 # ==================== Startup Update Check ====================
 _startup_update_check() {
@@ -113,9 +147,17 @@ _startup_update_check() {
 }
 _startup_update_check
 
+_kill_processes_on_port "$PORT"
+
+mkdir -p "$ACESTEP_TMP_DIR"
+export TMPDIR="$ACESTEP_TMP_DIR"
+export TEMP="$ACESTEP_TMP_DIR"
+export TMP="$ACESTEP_TMP_DIR"
+
 echo "Starting ACE-Step REST API Server..."
 echo "API will be available at: http://${HOST}:${PORT}"
 echo "API Documentation: http://${HOST}:${PORT}/docs"
+echo "Temporary files will be stored in: ${ACESTEP_TMP_DIR}"
 echo
 
 # Check if uv is installed

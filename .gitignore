@@ -266,3 +266,4 @@ package-lock.json
 .tmp/
 api_server.pid
 api_outputs/
+run_local_*.sh
