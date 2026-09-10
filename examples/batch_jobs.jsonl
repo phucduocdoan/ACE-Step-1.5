@@ -1,0 +1,5 @@
+{"id": "road-trip-folk", "prompt": "warm acoustic folk ballad about a road trip at sunrise", "lyrics": "[Verse]\nHeaded west before the light\nCoffee cold and taillights bright\n[Chorus]\nWe don't know where we'll land\nJust the road and your hand", "audio_duration": 180}
+{"prompt": "moody synthwave instrumental for a night drive", "lyrics": "", "audio_duration": 120}
+{"prompt": "playful children's song about counting stars", "lyrics": "[Verse]\nOne two three, look and see\nStars are winking down at me", "audio_duration": 90, "vocal_language": "en"}
+{"prompt": "lo-fi hip hop beat, rain on a window, study mood", "lyrics": "", "audio_duration": 150, "inference_steps": 16}
+{"id": "trailer-theme-variations", "prompt": "epic orchestral trailer theme, rising brass and choir", "lyrics": "", "audio_duration": 60, "batch_size": 4}

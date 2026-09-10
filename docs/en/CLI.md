@@ -81,3 +81,9 @@ When `thinking=True` and a config file is loaded via `--config`, the CLI looks f
 When running without a config file (wizard mode), the CLI writes the LM's formatted prompt to `instruction.txt` and pauses so you can edit it before audio-token generation proceeds.
 
 This allows fine-tuning the exact prompt (caption, lyrics, metadata) that the LM sees before generating audio codes.
+
+---
+
+## Related: REST API Clients
+
+`cli.py` runs generation locally, in-process. To drive a running ACE-Step API server instead — e.g. from another machine, or to queue many jobs — use `acestep/api_client.py` (single job) and `acestep/api_batch.py` (batch runner over a JSONL job file). See [API.md: CLI Clients](API.md#14-cli-clients-api_clientpy--api_batchpy).

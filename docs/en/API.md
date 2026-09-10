@@ -27,6 +27,7 @@ This service provides an HTTP-based asynchronous music generation API.
 - [Download Audio Files](#10-download-audio-files)
 - [Health Check](#11-health-check)
 - [Environment Variables](#12-environment-variables)
+- [CLI Clients (api_client.py / api_batch.py)](#14-cli-clients-api_clientpy--api_batchpy)
 - [Training API](#training-api)
 
 ---
@@ -60,15 +61,14 @@ curl -X POST http://localhost:8001/release_task \
 
 ### Configuring API Key
 
-Set via environment variable or command-line argument:
+Set via environment variable (this is the only method that currently works — see the warning below):
 
 ```bash
-# Environment variable
 export ACESTEP_API_KEY=your-secret-key
-
-# Or command-line argument
-python -m acestep.api_server --api-key your-secret-key
+python -m acestep.api_server
 ```
+
+> **Known bug: `--api-key` on the server is silently ignored.** `acestep/api_server.py` calls `app = create_app()` at **module import time** (line 359), and `create_app()` reads `ACESTEP_API_KEY` from the environment at that point (line 193). `run_api_server_main()` in `acestep/api/server_cli.py` only sets `os.environ["ACESTEP_API_KEY"]` from the `--api-key` flag *after* that import has already happened (inside `main()`, which runs after `app` is built), so the key it sets is never seen by `create_app()`. `python -m acestep.api_server --api-key your-secret-key` starts the server with auth **disabled**, with no error or warning. Until this is fixed in code, set `ACESTEP_API_KEY` in the environment before launching the server, as shown above.
 
 ---
 
@@ -775,6 +775,125 @@ The API server can be configured using environment variables:
 | `ACESTEP_TMPDIR` | `.cache/acestep/tmp` | Temporary file directory |
 | `TRITON_CACHE_DIR` | `.cache/acestep/triton` | Triton cache directory |
 | `TORCHINDUCTOR_CACHE_DIR` | `.cache/acestep/torchinductor` | TorchInductor cache directory |
+
+---
+
+## 14. CLI Clients (api_client.py / api_batch.py)
+
+`acestep/api_client.py` and `acestep/api_batch.py` are command-line clients for the `/release_task` / `/query_result` API described above: a single-job runner and a batch runner over a JSONL job file. Both require a running API server (see [Authentication](#1-authentication) above for the `--api-key` caveat).
+
+### 14.1 Single Job: `api_client.py`
+
+Submits one `/release_task`, polls `/query_result` until it finishes, and downloads the resulting audio.
+
+```bash
+# Basic text2music job
+python -m acestep.api_client --base-url http://127.0.0.1:8001 \
+  --prompt "upbeat pop song" --lyrics "Hello world" --audio-duration 120
+
+# With LM thinking mode and an API key
+python -m acestep.api_client --base-url http://127.0.0.1:8001 --api-key your-secret-key \
+  --prompt "moody synthwave" --thinking --batch-size 4 --output-dir out/synthwave
+```
+
+Every flag comes from `build_arg_parser()` in `acestep/api_client.py`; run `python -m acestep.api_client --help` for the exhaustive, current list. Key behaviors:
+
+- `--seed` accepts a single seed or a comma-separated list; setting it also forces `use_random_seed=false` in the payload.
+- `--src-audio` is required when `--task-type` is `cover`, `cover-nofsq`, or `repaint`; `--repainting-end` is additionally required for `repaint`. These are enforced by `validate_args()` before any network call.
+- `--no-download` prints the returned audio URLs instead of downloading them.
+- `--timeout` (default `900`s) is how long this single job is allowed to poll before the client gives up and raises `TimeoutError`. `--poll-interval` (default `2`s) is the wait between polls.
+- Exit code: `0` on success, `1` on any error (including timeout), with `error: ...` printed to stdout.
+
+### 14.2 Batch: `api_batch.py`
+
+Runs many jobs from a JSONL file through the same API, submitting new jobs as soon as the server frees up, and recording a resumable manifest.
+
+```bash
+python -m acestep.api_batch --base-url http://127.0.0.1:8001 \
+  --jobs examples/batch_jobs.jsonl --output-dir out/batch1 --max-inflight 4
+```
+
+See [`examples/batch_jobs.jsonl`](../../examples/batch_jobs.jsonl) for a small, runnable job file.
+
+#### Job file format
+
+One JSON object per line (blank lines and lines starting with `#` are skipped). Every key is optional — anything not set on a job line falls back to the matching `--flag` given on the command line (e.g. jobs without `"inference_steps"` use the batch command's `--inference-steps`, default `8`).
+
+**Job keys** — these are the `build_arg_parser()` dest names verbatim, not the API's snake_case/camelCase aliases (see [4.2](#42-request-parameters)): a job line with `"duration"` instead of `"audio_duration"` is rejected as an unknown field, it is not treated as an alias.
+
+| Job key | Type | Default | Notes |
+| :--- | :--- | :--- | :--- |
+| `id` | string | auto-generated | See [Job IDs](#job-ids) below. Not passed through to the API payload. |
+| `task_type` | string | `"text2music"` | One of `text2music`, `cover`, `cover-nofsq`, `repaint` |
+| `prompt` | string | `""` | Music prompt/caption |
+| `lyrics` | string | `""` | Lyrics text |
+| `src_audio` | string (path) | `null` | Local file, required for `cover`/`cover-nofsq`/`repaint` |
+| `reference_audio` | string (path) | `null` | Optional local reference audio file |
+| `audio_duration` | float | `null` | Target duration in seconds |
+| `batch_size` | int | `1` | Variations of this one job's prompt — see [batch_size vs. separate jobs](#batch_size-vs-separate-jobs) |
+| `inference_steps` | int | `8` | Diffusion inference steps |
+| `guidance_scale` | float | `7.0` | CFG scale |
+| `thinking` | bool | `false` | Enable 5Hz LM thinking mode |
+| `model` | string | `null` | Optional DiT model name |
+| `audio_format` | string | `"mp3"` | `mp3`/`flac`/`wav`/`opus`/`aac`/`wav32` |
+| `seed` | string/int | `null` | Seed or comma-separated seeds; also sets `use_random_seed=false` |
+| `vocal_language` | string | `"en"` | Lyrics language code |
+| `repainting_start` | float | `0.0` | Repaint region start (seconds) |
+| `repainting_end` | float | `null` | Repaint region end (seconds); required for `repaint` |
+| `repaint_mode` | string | `"balanced"` | `conservative`/`balanced`/`aggressive` |
+| `repaint_strength` | float | `0.5` | Repaint strength |
+
+**Command-line-only flags** — rejected inside a job line, because `run_batch` reads them from the top-level `args`, so a per-job override would be silently ignored otherwise: `base_url`, `api_key`, `output_dir`, `timeout`, `poll_interval`, `no_download` (`CLI_ONLY_FIELDS` in `acestep/api_batch.py`). A job line setting one of these fails to load with:
+
+```
+<jobs_path>:<line>: field(s) can only be set on the command line, not per job: <field, ...>
+```
+
+The batch-only flags `jobs`, `max_inflight`, `manifest`, `no_resume` (`BATCH_ONLY_FIELDS`) are likewise rejected per job, since they configure the runner itself, not a single job.
+
+Any other unrecognized key fails with `<jobs_path>:<line>: unknown job field(s): <field, ...>`. Invalid JSON on a line fails with `<jobs_path>:<line>: invalid JSON: <reason>`.
+
+#### Job IDs
+
+- Set `"id"` explicitly to name a job. IDs must not contain `/` or `\`, and must be unique within the file — a duplicate raises `<jobs_path>:<line>: duplicate job id '<id>'`.
+- If `"id"` is omitted, the ID is derived by hashing the job's own JSON content (`job-<8 hex chars>` from a SHA-256 of the sorted-key JSON, `auto_job_id()` in `acestep/api_batch.py`), not the line's position. This is deliberate: resume matches by job ID, and a positional ID like `job-0003` would silently rebind to a different job as soon as a line is inserted or removed above it. Content hashing keeps a job's identity attached to what it actually asks for; byte-identical lines get a `-2`, `-3`, ... suffix.
+- IDs (explicit or auto) also become the filename prefix for downloaded audio and the `id` field in the manifest.
+
+#### The manifest
+
+Defaults to `<output-dir>/manifest.jsonl`, or `--manifest <path>`. One JSON object appended per completed/failed job, flushed immediately, so it is safe to read (or interrupt the batch) at any time. Fields per row: `id`, `prompt`, `status` (`"succeeded"`/`"failed"`), plus `task_id`, `files` (on success), or `error` (on failure).
+
+On the next run, jobs whose manifest row has `status == "succeeded"` are skipped automatically (resume). Pass `--no-resume` to re-run everything, including previously succeeded jobs, ignoring the manifest.
+
+#### Failure and stalls
+
+- A job that fails to submit (HTTP error other than 429, malformed job, etc.) or whose task comes back with a non-success status is recorded as `"failed"` in the manifest and does not stop the batch.
+- HTTP `429 Server busy: queue is full` is not a failure: the batch simply stops submitting until the queue has room.
+- `--timeout` means something different in batch mode than for `api_client.py`: it is a **stall timeout** — the batch gives up on all currently in-flight jobs if *no job at all* completes within that many seconds (default `1800`s). This is unrelated to how long any individual job may sit in the queue behind others.
+- Stalls are cumulative: after `MAX_CONSECUTIVE_STALLS` (3) consecutive stall windows with zero completions, the batch aborts entirely and fails every remaining pending job too, on the assumption the server is down or unresponsive rather than merely slow.
+
+#### Exit codes
+
+`0` if every job succeeded (or there was nothing left to do after resume); `1` if any job failed, or the jobs file failed to load (bad `--jobs` path, invalid JSON, bad `--max-inflight`); `130` on `Ctrl-C` (the manifest reflects whatever had completed so far, and a re-run resumes from it).
+
+#### `--max-inflight`
+
+Caps how many submitted-but-not-yet-finished jobs the batch keeps outstanding (default `8`). **This does not parallelize generation.** The server that `create_app()` builds runs a single worker (`WORKER_COUNT = int(os.getenv("ACESTEP_QUEUE_WORKERS", "1"))` in `acestep/api_server.py`), so every job is generated strictly serially on one GPU regardless of `--max-inflight`. Raising it only lets the batch keep more jobs queued server-side at once, which avoids repeatedly hitting HTTP 429 and re-submitting; it buys queue depth, not throughput.
+
+#### `batch_size` vs. separate jobs
+
+`batch_size: N` inside one job produces **N variations of that job's one prompt**, not N different songs — the LM/DiT generate `N` samples from the same `prompt`/`lyrics` in one task. It does not help you generate many different songs faster; for that, use one job per song and let the batch runner queue them.
+
+Measured on this machine: 8 separate single-song jobs took 79.25s total (9.91 s/file); one job with `batch_size: 8` took ~16.4s (2.06 s/file) — about 4.8x faster per file. That speedup is specific to generating variations of one prompt. If you need many different songs, you get no such speedup from `batch_size`; running them as separate jobs through `api_batch.py` instead gains you queue automation, resume, and eliminating GPU idle time between jobs (roughly 6% here) — not a per-file speedup.
+
+**Which should I use?**
+
+| You want... | Use |
+| :--- | :--- |
+| Several *different* songs (different prompt/lyrics each) | One job per song in the JSONL file, `batch_size: 1` (default) |
+| Several *variations* of the *same* prompt | One job, `batch_size: N` |
+
+The server advertises `Max Batch Size (with LM): 8` at startup (`acestep/api/startup_model_init.py`), and the LM stage processes batches sequentially in chunks of `lm_batch_chunk_size` (default `8`, `acestep/inference.py:258`), so `batch_size` above 8 gains nothing even for the variations case. Worse, over REST it **fails outright**. Measured twice on this machine's 80 GB H100: `batch_size: 16` returned a failed task producing 0 files (peak VRAM only ~68 GB, so this is not an out-of-memory condition), while `batch_size: 8` succeeded in the same run. Nothing on the REST path clamps the request down to the advertised limit — the VRAM-based auto-reduce in `_vram_guard_reduce_batch` (`acestep/core/generation/handler/memory_utils.py:~155`) sizes the batch from currently-free VRAM rather than the GPU's tier limit, so on a large-VRAM GPU it does not shrink an oversized request. Only the Gradio UI clamps `batch_size`, via the slider's `maximum`. Keep `batch_size` at 8 or below when calling the REST API directly.
 
 ---
 
