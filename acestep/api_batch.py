@@ -28,6 +28,12 @@ from acestep.api_client import (
 # CLI flags that configure the batch runner itself and cannot be set per job.
 BATCH_ONLY_FIELDS = frozenset({"jobs", "max_inflight", "manifest", "no_resume"})
 
+# Single-job flags that run_batch reads from the global args instead of the
+# per-job args, so a per-job override would silently be ignored.
+CLI_ONLY_FIELDS = frozenset(
+    {"base_url", "api_key", "output_dir", "timeout", "poll_interval", "no_download"}
+)
+
 
 @dataclass
 class Job:
@@ -66,6 +72,12 @@ def build_batch_arg_parser() -> argparse.ArgumentParser:
         help="Re-run jobs already recorded as succeeded in the manifest.",
     )
     parser.set_defaults(timeout=1800.0)
+    # --timeout means something different here than for a single job. argparse
+    # offers no public way to re-word an inherited option, and re-adding it
+    # needs the equally private parser._optionals.conflict_handler.
+    parser._option_string_actions["--timeout"].help = (
+        "Stall timeout: give up when no job at all completes within this many seconds."
+    )
     return parser
 
 
@@ -91,7 +103,7 @@ def auto_job_id(overrides: dict[str, Any], taken: set[str]) -> str:
 def load_jobs(jobs_path: str, defaults: argparse.Namespace) -> list[Job]:
     """Read a JSONL job file, layering each entry over the CLI defaults."""
 
-    allowed = set(vars(defaults)) - BATCH_ONLY_FIELDS
+    allowed = set(vars(defaults)) - BATCH_ONLY_FIELDS - CLI_ONLY_FIELDS
     jobs: list[Job] = []
     seen: set[str] = set()
     lines = Path(jobs_path).read_text(encoding="utf-8").splitlines()
@@ -110,7 +122,18 @@ def load_jobs(jobs_path: str, defaults: argparse.Namespace) -> list[Job]:
         explicit_id = str(overrides.pop("id", "") or "").strip()
         if explicit_id and explicit_id in seen:
             raise ValueError(f"{jobs_path}:{line_number}: duplicate job id '{explicit_id}'")
+        if "/" in explicit_id or "\\" in explicit_id:
+            raise ValueError(
+                f"{jobs_path}:{line_number}: job id must not contain a path separator: '{explicit_id}'"
+            )
         job_id = explicit_id or auto_job_id(overrides, seen)
+
+        cli_only = sorted(set(overrides) & CLI_ONLY_FIELDS)
+        if cli_only:
+            raise ValueError(
+                f"{jobs_path}:{line_number}: field(s) can only be set on the command line, "
+                f"not per job: {', '.join(cli_only)}"
+            )
         unknown = sorted(set(overrides) - allowed)
         if unknown:
             raise ValueError(
@@ -145,7 +168,17 @@ def append_manifest_row(manifest_path: Path, row: dict[str, Any]) -> None:
     """Append one manifest row, flushing immediately so runs stay resumable."""
 
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    # A crash mid-write can leave the file without a trailing newline; without
+    # this, the next append would concatenate onto that torn row and corrupt
+    # this genuinely complete one too.
+    needs_leading_newline = False
+    if manifest_path.exists() and manifest_path.stat().st_size > 0:
+        with manifest_path.open("rb") as handle:
+            handle.seek(-1, 2)
+            needs_leading_newline = handle.read(1) != b"\n"
     with manifest_path.open("a", encoding="utf-8") as handle:
+        if needs_leading_newline:
+            handle.write("\n")
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
@@ -175,6 +208,11 @@ def _collect_job_files(
     return [str(path) for path in saved]
 
 
+# Consecutive stall windows with no successful completion before the whole
+# batch gives up, rather than just the currently in-flight job(s).
+MAX_CONSECUTIVE_STALLS = 3
+
+
 def run_batch(
     session: requests.Session,
     args: argparse.Namespace,
@@ -190,127 +228,175 @@ def run_batch(
     succeeded = 0
     failed = 0
     last_completion = monotonic()
+    consecutive_stalls = 0
 
     def record(job: Job, row: dict[str, Any]) -> None:
         append_manifest_row(manifest_path, {"id": job.job_id, "prompt": job.args.prompt, **row})
 
-    while pending or inflight:
-        # Set whenever a job reaches a terminal state this cycle. A completion
-        # frees the server's worker, so the next job must be submitted at once
-        # instead of after another poll interval of idle GPU.
-        progressed = False
+    try:
+        while pending or inflight:
+            # Set whenever a job reaches a terminal state this cycle. A completion
+            # frees the server's worker, so the next job must be submitted at once
+            # instead of after another poll interval of idle GPU.
+            progressed = False
 
-        while pending and len(inflight) < args.max_inflight:
-            job = pending[0]
-            try:
-                validate_args(job.args)
-            except ValueError as exc:
-                pending.popleft()
-                failed += 1
-                record(job, {"status": "failed", "error": f"invalid job: {exc}"})
-                print(f"[invalid] {job.job_id}: {exc}")
-                continue
-
-            try:
-                task_id = submit_generation_task(
-                    session=session,
-                    base_url=args.base_url,
-                    api_key=args.api_key,
-                    payload=build_release_task_payload(job.args),
-                    src_audio=job.args.src_audio,
-                    reference_audio=job.args.reference_audio,
-                )
-            except requests.HTTPError as exc:
-                if _is_queue_full_error(exc):
-                    break
-                pending.popleft()
-                failed += 1
-                record(job, {"status": "failed", "error": f"submit failed: {exc}"})
-                print(f"[failed] {job.job_id}: submit failed: {exc}")
-                continue
-            except (requests.ConnectionError, requests.Timeout) as exc:
-                print(f"[warn] {job.job_id}: submit unreachable, retrying: {exc}")
-                break
-            except Exception as exc:
-                pending.popleft()
-                failed += 1
-                record(job, {"status": "failed", "error": f"submit failed: {exc}"})
-                print(f"[failed] {job.job_id}: submit failed: {exc}")
-                continue
-
-            pending.popleft()
-            inflight[task_id] = job
-            print(f"[submit] {job.job_id} -> {task_id} (inflight {len(inflight)}, pending {len(pending)})")
-
-        if inflight:
-            try:
-                items = query_tasks(session, args.base_url, args.api_key, list(inflight))
-            except requests.RequestException as exc:
-                # A dropped connection is routine while the server is busy loading
-                # models; the stall timeout below bounds how long we keep retrying.
-                print(f"[warn] poll failed, retrying: {exc}")
-                items = []
-
-            for item in items:
-                task_id = str(item.get("task_id", ""))
-                job = inflight.get(task_id)
-                if job is None:
-                    continue
-                status = int(item.get("status", 0))
-                if status == 0:
-                    continue
-
-                del inflight[task_id]
-                last_completion = monotonic()
-                progressed = True
-                if status != 1:
-                    # Anything that is neither pending (0) nor success (1) is a
-                    # failure, including statuses this client does not know yet.
+            while pending and len(inflight) < args.max_inflight:
+                job = pending[0]
+                try:
+                    validate_args(job.args)
+                except ValueError as exc:
+                    pending.popleft()
                     failed += 1
-                    record(job, {"task_id": task_id, "status": "failed", "error": f"task failed: {item}"})
-                    print(f"[failed] {job.job_id}: task failed (status {status})")
+                    record(job, {"status": "failed", "error": f"invalid job: {exc}"})
+                    print(f"[invalid] {job.job_id}: {exc}")
                     continue
 
                 try:
-                    files = _collect_job_files(session, args, job, parse_query_result_item(item))
-                except Exception as exc:
+                    task_id = submit_generation_task(
+                        session=session,
+                        base_url=args.base_url,
+                        api_key=args.api_key,
+                        payload=build_release_task_payload(job.args),
+                        src_audio=job.args.src_audio,
+                        reference_audio=job.args.reference_audio,
+                    )
+                except requests.HTTPError as exc:
+                    if _is_queue_full_error(exc):
+                        break
+                    pending.popleft()
                     failed += 1
-                    record(job, {"task_id": task_id, "status": "failed", "error": f"download failed: {exc}"})
-                    print(f"[failed] {job.job_id}: download failed: {exc}")
+                    record(job, {"status": "failed", "error": f"submit failed: {exc}"})
+                    print(f"[failed] {job.job_id}: submit failed: {exc}")
+                    continue
+                except (requests.ConnectionError, requests.Timeout) as exc:
+                    print(f"[warn] {job.job_id}: submit unreachable, retrying: {exc}")
+                    break
+                except Exception as exc:
+                    pending.popleft()
+                    failed += 1
+                    record(job, {"status": "failed", "error": f"submit failed: {exc}"})
+                    print(f"[failed] {job.job_id}: submit failed: {exc}")
                     continue
 
-                if not files:
-                    # The server reports success with a placeholder empty result
-                    # when it produced no audio. Recording that as succeeded
-                    # would make resume skip the job forever.
+                pending.popleft()
+                if task_id in inflight:
+                    # Unreachable against this server (task ids are uuid4), but a
+                    # reused task_id would otherwise silently overwrite the entry
+                    # and lose the earlier job with no manifest row.
+                    displaced = inflight[task_id]
                     failed += 1
                     record(
-                        job,
+                        displaced,
                         {
                             "task_id": task_id,
                             "status": "failed",
-                            "error": "task succeeded but returned no audio",
+                            "error": f"task_id '{task_id}' was reused by another submission",
                         },
                     )
-                    print(f"[failed] {job.job_id}: task returned no audio")
-                    continue
+                    print(f"[warn] {displaced.job_id}: task_id '{task_id}' reused by {job.job_id}, displaced job failed")
+                inflight[task_id] = job
+                print(f"[submit] {job.job_id} -> {task_id} (inflight {len(inflight)}, pending {len(pending)})")
 
-                succeeded += 1
-                record(job, {"task_id": task_id, "status": "succeeded", "files": files})
-                print(f"[done] {job.job_id}: {len(files)} file(s)")
+            if inflight:
+                try:
+                    items = query_tasks(session, args.base_url, args.api_key, list(inflight))
+                except requests.RequestException as exc:
+                    # A dropped connection is routine while the server is busy loading
+                    # models; the stall timeout below bounds how long we keep retrying.
+                    print(f"[warn] poll failed, retrying: {exc}")
+                    items = []
 
-        if monotonic() - last_completion > args.timeout:
-            for task_id, job in inflight.items():
-                failed += 1
-                record(job, {"task_id": task_id, "status": "failed", "error": "batch stalled"})
-            for job in pending:
-                failed += 1
-                record(job, {"status": "failed", "error": "batch stalled before submission"})
-            print(f"[stalled] no job completed within {args.timeout}s, aborting batch")
-            break
+                if not isinstance(items, list):
+                    print(f"[warn] poll returned a malformed response, retrying: {items!r}")
+                    items = []
 
-        if (pending or inflight) and not progressed:
-            sleep(args.poll_interval)
+                for item in items:
+                    if not isinstance(item, dict):
+                        print(f"[warn] poll returned a malformed item, skipping: {item!r}")
+                        continue
+                    task_id = str(item.get("task_id", ""))
+                    job = inflight.get(task_id)
+                    if job is None:
+                        continue
+                    status = int(item.get("status", 0))
+                    if status == 0:
+                        continue
+
+                    del inflight[task_id]
+                    last_completion = monotonic()
+                    # A terminal result of any kind proves the server is alive,
+                    # so it clears the stall streak as much as a success does.
+                    consecutive_stalls = 0
+                    progressed = True
+                    if status != 1:
+                        # Anything that is neither pending (0) nor success (1) is a
+                        # failure, including statuses this client does not know yet.
+                        failed += 1
+                        record(job, {"task_id": task_id, "status": "failed", "error": f"task failed: {item}"})
+                        print(f"[failed] {job.job_id}: task failed (status {status})")
+                        continue
+
+                    try:
+                        files = _collect_job_files(session, args, job, parse_query_result_item(item))
+                    except Exception as exc:
+                        failed += 1
+                        record(job, {"task_id": task_id, "status": "failed", "error": f"download failed: {exc}"})
+                        print(f"[failed] {job.job_id}: download failed: {exc}")
+                        continue
+
+                    if not files:
+                        # The server reports success with a placeholder empty result
+                        # when it produced no audio. Recording that as succeeded
+                        # would make resume skip the job forever.
+                        failed += 1
+                        record(
+                            job,
+                            {
+                                "task_id": task_id,
+                                "status": "failed",
+                                "error": "task succeeded but returned no audio",
+                            },
+                        )
+                        print(f"[failed] {job.job_id}: task returned no audio")
+                        continue
+
+                    succeeded += 1
+                    record(job, {"task_id": task_id, "status": "succeeded", "files": files})
+                    print(f"[done] {job.job_id}: {len(files)} file(s)")
+
+            if monotonic() - last_completion > args.timeout:
+                consecutive_stalls += 1
+                stalled = len(inflight)
+                for task_id, job in inflight.items():
+                    failed += 1
+                    record(job, {"task_id": task_id, "status": "failed", "error": "batch stalled"})
+                inflight.clear()
+
+                if consecutive_stalls >= MAX_CONSECUTIVE_STALLS:
+                    for job in pending:
+                        failed += 1
+                        record(job, {"status": "failed", "error": "batch stalled before submission"})
+                    print(
+                        f"[stalled] no job completed within {args.timeout}s "
+                        f"({consecutive_stalls} consecutive stalls), aborting the rest of the batch"
+                    )
+                    break
+
+                print(
+                    f"[stalled] no job completed within {args.timeout}s "
+                    f"({consecutive_stalls}/{MAX_CONSECUTIVE_STALLS} consecutive stalls), "
+                    f"failed {stalled} in-flight job(s), continuing with the rest"
+                )
+                last_completion = monotonic()
+
+            if (pending or inflight) and not progressed:
+                sleep(args.poll_interval)
+    except KeyboardInterrupt:
+        print(
+            f"[interrupted] succeeded={succeeded} failed={failed} "
+            f"pending={len(pending)} inflight={len(inflight)}"
+        )
+        raise
 
     return succeeded, failed
 
@@ -346,7 +432,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         # GET /v1/audio is auth-gated too, and download_audio_files does not
         # build per-request headers, so authenticate the session itself.
         session.headers.update(build_headers(args.api_key))
-        succeeded, failed = run_batch(session, args, jobs, manifest_path)
+        try:
+            succeeded, failed = run_batch(session, args, jobs, manifest_path)
+        except KeyboardInterrupt:
+            return 130
+        except Exception as exc:
+            print(f"error: {exc}")
+            return 1
 
     print(f"done: succeeded={succeeded} failed={failed} total={succeeded + failed}")
     return 1 if failed else 0

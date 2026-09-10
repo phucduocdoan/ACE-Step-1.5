@@ -7,7 +7,7 @@ import json
 import time
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
@@ -75,6 +75,8 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
+    if args.poll_interval <= 0:
+        raise ValueError("--poll-interval must be > 0")
     if args.task_type in {"cover", "cover-nofsq", "repaint"} and not args.src_audio:
         raise ValueError(f"--src-audio is required for task type '{args.task_type}'")
     if args.task_type == "repaint" and args.repainting_end is None:
@@ -184,15 +186,17 @@ def poll_task_result(
     task_id: str,
     poll_interval: float,
     timeout: float,
+    sleep: Callable[[float], None] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> list[dict[str, Any]]:
     """Poll ``/query_result`` until the task succeeds or fails."""
 
-    deadline = time.time() + timeout
+    deadline = monotonic() + timeout
     last_progress = None
-    while time.time() < deadline:
+    while monotonic() < deadline:
         items = query_tasks(session, base_url, api_key, [task_id])
         if not items:
-            time.sleep(poll_interval)
+            sleep(poll_interval)
             continue
         task = items[0]
         status = int(task.get("status", 0))
@@ -204,7 +208,7 @@ def poll_task_result(
             return parse_query_result_item(task)
         if status == 2:
             raise RuntimeError(f"task failed: {task}")
-        time.sleep(poll_interval)
+        sleep(poll_interval)
     raise TimeoutError(f"task {task_id} did not finish within {timeout} seconds")
 
 
@@ -234,6 +238,9 @@ def download_audio_files(
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    # file_prefix may come from a user-controlled job id or a server-supplied
+    # task_id; strip path separators so it can never write outside output_dir.
+    safe_prefix = file_prefix.replace("/", "_").replace("\\", "_")
     saved_paths: list[Path] = []
     for index, item in enumerate(audio_items):
         file_url = str(item.get("file", "")).strip()
@@ -241,7 +248,7 @@ def download_audio_files(
             continue
         response = session.get(resolve_audio_url(base_url, file_url), timeout=300)
         response.raise_for_status()
-        output_path = out_dir / f"{file_prefix}_{index}{infer_output_suffix(file_url)}"
+        output_path = out_dir / f"{safe_prefix}_{index}{infer_output_suffix(file_url)}"
         output_path.write_bytes(response.content)
         saved_paths.append(output_path)
     return saved_paths

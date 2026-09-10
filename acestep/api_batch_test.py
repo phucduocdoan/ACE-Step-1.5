@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from collections import deque
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 import requests
 
 from acestep.api_batch import (
+    append_manifest_row,
     build_batch_arg_parser,
     load_completed_job_ids,
     load_jobs,
@@ -54,6 +57,8 @@ class FakeApi:
         poll_connection_errors: int = 0,
         empty_result_task_ids=(),
         unknown_status_task_ids=(),
+        stalled_task_ids=(),
+        malformed_poll_responses=(),
     ) -> None:
         self.polls_before_done = polls_before_done
         self.fail_task_ids = set(fail_task_ids)
@@ -62,6 +67,12 @@ class FakeApi:
         self.poll_connection_errors = poll_connection_errors
         self.empty_result_task_ids = set(empty_result_task_ids)
         self.unknown_status_task_ids = set(unknown_status_task_ids)
+        # Tasks that never leave status 0, e.g. a task_id the server forgot
+        # about after a restart.
+        self.stalled_task_ids = set(stalled_task_ids)
+        # Canned malformed ``data`` payloads (a dict, or a list with a
+        # non-dict item) returned in order before falling back to normal.
+        self.malformed_poll_responses = deque(malformed_poll_responses)
         self.headers: dict[str, str] = {}
         self.submitted: list[str] = []
         self.polls: dict[str, int] = {}
@@ -117,8 +128,13 @@ class FakeApi:
         if self.poll_connection_errors:
             self.poll_connection_errors -= 1
             raise requests.ConnectionError("connection reset by peer")
+        if self.malformed_poll_responses:
+            return FakeResponse({"data": self.malformed_poll_responses.popleft()})
         items = []
         for task_id in task_ids:
+            if task_id in self.stalled_task_ids:
+                items.append({"task_id": task_id, "status": 0, "result": "[]"})
+                continue
             self.polls[task_id] = self.polls.get(task_id, 0) + 1
             if self.polls[task_id] < self.polls_before_done:
                 items.append({"task_id": task_id, "status": 0, "result": "[]"})
@@ -140,13 +156,26 @@ class FakeApi:
         return FakeResponse({"data": items})
 
 
+class DuplicateTaskIdApi(FakeApi):
+    """Always returns the same task_id, to exercise the reused-task_id guard."""
+
+    def _release_task(self) -> FakeResponse:
+        """Queue a task under a fixed task_id, unlike the base class's unique IDs."""
+
+        self.submitted.append("task-dup")
+        self.polls["task-dup"] = 0
+        return FakeResponse({"data": {"task_id": "task-dup", "status": "queued"}})
+
+
 def build_args(jobs_path: str, output_dir: str, **overrides):
     """Build a batch argument namespace with test-friendly defaults."""
 
     argv = [
         "--jobs", jobs_path,
         "--output-dir", output_dir,
-        "--poll-interval", "0",
+        # Must be positive: --poll-interval is validated. Sleep is injected in
+        # tests, so this tiny interval keeps them fast without disabling it.
+        "--poll-interval", "0.001",
     ]
     for key, value in overrides.items():
         argv.extend([f"--{key.replace('_', '-')}", str(value)])
@@ -165,6 +194,18 @@ def read_manifest(manifest_path: Path) -> list[dict]:
     """Read every manifest row written during a run."""
 
     return [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+class ArgParserTests(unittest.TestCase):
+    """The batch parser's help text must describe batch-mode semantics."""
+
+    def test_timeout_help_describes_the_batch_wide_stall_meaning(self) -> None:
+        """--timeout means a per-poll timeout in the single-job client, but a stall
+        timeout here; the help text must say so instead of reusing that wording."""
+
+        parser = build_batch_arg_parser()
+        help_text = parser._option_string_actions["--timeout"].help
+        self.assertIn("stall", help_text.lower())
 
 
 class LoadJobsTests(unittest.TestCase):
@@ -245,6 +286,27 @@ class LoadJobsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unknown job field\\(s\\): max_inflight"):
                 load_jobs(jobs_path, args)
 
+    def test_cli_only_field_is_rejected_with_a_distinct_message(self) -> None:
+        """A field run_batch reads from the global args must not be silently ignored per job."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"prompt": "ok", "output_dir": "elsewhere"}'])
+            args = build_args(jobs_path, tmp)
+            with self.assertRaisesRegex(
+                ValueError,
+                r"jobs\.jsonl:1: field\(s\) can only be set on the command line, not per job: output_dir",
+            ):
+                load_jobs(jobs_path, args)
+
+    def test_job_id_with_path_separator_is_rejected(self) -> None:
+        """A job id becomes a filename prefix and a manifest key, so it must not be a path."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "../escaped", "prompt": "ok"}'])
+            args = build_args(jobs_path, tmp)
+            with self.assertRaisesRegex(ValueError, "job id must not contain a path separator"):
+                load_jobs(jobs_path, args)
+
     def test_duplicate_job_id_is_rejected(self) -> None:
         """Duplicate IDs would collide in output filenames, so reject them."""
 
@@ -277,6 +339,20 @@ class ResumeTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(set(), load_completed_job_ids(Path(tmp) / "manifest.jsonl"))
+
+
+class AppendManifestRowTests(unittest.TestCase):
+    """A torn write must not corrupt the row appended after it."""
+
+    def test_append_repairs_a_torn_previous_row(self) -> None:
+        """A crash mid-write leaves no trailing newline; the next append must add one."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "manifest.jsonl"
+            manifest.write_text('{"id": "j1", "status": "succ', encoding="utf-8")
+            append_manifest_row(manifest, {"id": "j2", "status": "succeeded"})
+
+            self.assertIn("j2", load_completed_job_ids(manifest))
 
 
 class RunBatchTests(unittest.TestCase):
@@ -390,8 +466,13 @@ class RunBatchTests(unittest.TestCase):
         self.assertEqual((0, 1), (succeeded, failed))
         self.assertIn("submit failed", rows[0]["error"])
 
-    def test_stall_timeout_aborts_and_records_remaining_jobs(self) -> None:
-        """When nothing completes within the stall window the batch aborts."""
+    def test_stall_only_fails_the_inflight_job_and_the_batch_continues(self) -> None:
+        """A stall must fail only the stuck task, not every unsubmitted job.
+
+        Both jobs here stall in turn (each is the sole in-flight task when the
+        stall fires), so both still end up failed -- but each is only failed
+        after actually being submitted, never pre-emptively.
+        """
 
         clock = [0.0]
 
@@ -416,7 +497,113 @@ class RunBatchTests(unittest.TestCase):
 
         self.assertEqual((0, 2), (succeeded, failed))
         self.assertEqual("batch stalled", by_id["j1"]["error"])
-        self.assertEqual("batch stalled before submission", by_id["j2"]["error"])
+        self.assertEqual("batch stalled", by_id["j2"]["error"])
+
+    def test_batch_recovers_after_one_stall_and_finishes_the_rest(self) -> None:
+        """A job stuck forever must not condemn jobs that would otherwise finish."""
+
+        clock = [0.0]
+
+        def fake_sleep(seconds: float) -> None:
+            clock[0] += max(seconds, 1.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}', '{"id": "j2"}', '{"id": "j3"}'])
+            args = build_args(jobs_path, tmp, max_inflight=1, timeout=5)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            # j1 becomes task-1 and never completes; j2/j3 complete normally.
+            succeeded, failed = run_batch(
+                FakeApi(polls_before_done=1, stalled_task_ids={"task-1"}),
+                args,
+                jobs,
+                manifest,
+                sleep=fake_sleep,
+                monotonic=lambda: clock[0],
+            )
+            by_id = {row["id"]: row for row in read_manifest(manifest)}
+
+        self.assertEqual((2, 1), (succeeded, failed))
+        self.assertEqual("batch stalled", by_id["j1"]["error"])
+        self.assertEqual("succeeded", by_id["j2"]["status"])
+        self.assertEqual("succeeded", by_id["j3"]["status"])
+
+    def test_repeated_stalls_with_no_success_abort_after_the_cap(self) -> None:
+        """A permanently dead server must not cost ``timeout`` seconds per job."""
+
+        clock = [0.0]
+
+        def fake_sleep(seconds: float) -> None:
+            clock[0] += max(seconds, 1.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, [json.dumps({"id": f"j{i}"}) for i in range(5)])
+            args = build_args(jobs_path, tmp, max_inflight=1, timeout=5)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            # Nothing ever completes, so every stall counts toward the cap.
+            succeeded, failed = run_batch(
+                FakeApi(polls_before_done=10**6),
+                args,
+                jobs,
+                manifest,
+                sleep=fake_sleep,
+                monotonic=lambda: clock[0],
+            )
+            by_id = {row["id"]: row for row in read_manifest(manifest)}
+
+        self.assertEqual((0, 5), (succeeded, failed))
+        # The first 3 jobs were each submitted and stalled in turn (hitting
+        # the cap); the last 2 never got the chance to submit.
+        for job_id in ("j0", "j1", "j2"):
+            self.assertEqual("batch stalled", by_id[job_id]["error"])
+        for job_id in ("j3", "j4"):
+            self.assertEqual("batch stalled before submission", by_id[job_id]["error"])
+
+    def test_stall_counter_resets_on_any_terminal_completion_not_only_success(self) -> None:
+        """A genuine task failure proves the server is alive, same as a success.
+
+        j0 stalls (1 stall), j1 fails for real (proving the server answered),
+        then j2 and j3 stall. If the stall streak only reset on success, that
+        would be 3 stalls total against a cap of 3 and the batch would abort
+        before j4 ever got a chance to submit. Because a real completion
+        resets the streak too, only 2 stalls have happened since j1's
+        failure, so the batch keeps going and j4 runs to completion.
+        """
+
+        clock = [0.0]
+
+        def fake_sleep(seconds: float) -> None:
+            clock[0] += max(seconds, 1.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(
+                tmp, [json.dumps({"id": f"j{i}"}) for i in range(5)]
+            )
+            args = build_args(jobs_path, tmp, max_inflight=1, timeout=5)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            # Submission order is j0..j4 -> task-1..task-5.
+            succeeded, failed = run_batch(
+                FakeApi(
+                    stalled_task_ids={"task-1", "task-3", "task-4"},
+                    fail_task_ids={"task-2"},
+                ),
+                args,
+                jobs,
+                manifest,
+                sleep=fake_sleep,
+                monotonic=lambda: clock[0],
+            )
+            by_id = {row["id"]: row for row in read_manifest(manifest)}
+
+        self.assertEqual(5, succeeded + failed)
+        # The cap-triggering scenario would leave j4 unsubmitted; proving it
+        # ran to completion shows the streak did not wrongly accumulate.
+        self.assertEqual("succeeded", by_id["j4"]["status"])
 
     def test_completion_submits_the_next_job_without_waiting(self) -> None:
         """A finished job must free the worker immediately, not after a poll interval."""
@@ -512,6 +699,129 @@ class RunBatchTests(unittest.TestCase):
         self.assertEqual((0, 1), (succeeded, failed))
         self.assertEqual("batch stalled before submission", rows[0]["error"])
 
+    def test_duplicate_task_id_does_not_lose_a_job(self) -> None:
+        """A reused task_id must displace the earlier job with a manifest row, not silently drop it."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}', '{"id": "j2"}'])
+            args = build_args(jobs_path, tmp, max_inflight=2)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            succeeded, failed = run_batch(
+                DuplicateTaskIdApi(), args, jobs, manifest, sleep=lambda _: None
+            )
+            rows = read_manifest(manifest)
+
+        self.assertEqual(2, len(rows))
+        self.assertEqual(succeeded + failed, len(jobs))
+        by_id = {row["id"]: row for row in rows}
+        self.assertEqual("failed", by_id["j1"]["status"])
+        self.assertIn("reused", by_id["j1"]["error"])
+
+
+class PollResilienceTests(unittest.TestCase):
+    """A malformed /query_result response must not crash the batch."""
+
+    def test_dict_shaped_response_is_ignored_not_fatal(self) -> None:
+        """A dict instead of a list must not raise, and must warn once.
+
+        Iterating a dict yields its keys, so without the response-shape guard
+        every key would be reported as its own malformed item -- a wall of
+        warnings that names none of the shapes actually received.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            args = build_args(jobs_path, tmp)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                succeeded, failed = run_batch(
+                    FakeApi(malformed_poll_responses=[{"code": 0, "message": "ok", "data": {}}]),
+                    args,
+                    jobs,
+                    manifest,
+                    sleep=lambda _: None,
+                )
+
+        self.assertEqual((1, 0), (succeeded, failed))
+        warnings = [line for line in buffer.getvalue().splitlines() if "malformed" in line]
+        self.assertEqual(1, len(warnings), warnings)
+        self.assertIn("malformed response", warnings[0])
+
+    def test_non_dict_item_in_response_is_skipped_not_fatal(self) -> None:
+        """A list response containing a non-dict item must not raise."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            args = build_args(jobs_path, tmp)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            succeeded, failed = run_batch(
+                FakeApi(malformed_poll_responses=[["not-a-dict-item"]]),
+                args,
+                jobs,
+                manifest,
+                sleep=lambda _: None,
+            )
+
+        self.assertEqual((1, 0), (succeeded, failed))
+
+
+class MainErrorHandlingTests(unittest.TestCase):
+    """``main`` must report failures cleanly instead of raising a traceback."""
+
+    def test_run_batch_exception_is_reported_not_raised(self) -> None:
+        """An unexpected exception mid-batch must print an error and return 1."""
+
+        api = FakeApi()
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api), mock.patch(
+                "acestep.api_batch.run_batch", side_effect=RuntimeError("boom")
+            ):
+                exit_code = main(["--jobs", jobs_path, "--output-dir", tmp, "--poll-interval", "0.001"])
+
+        self.assertEqual(1, exit_code)
+
+    def test_keyboard_interrupt_returns_130_not_a_traceback(self) -> None:
+        """Ctrl-C on a long batch must exit 130 with a summary, not a traceback."""
+
+        api = FakeApi()
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api), mock.patch(
+                "acestep.api_batch.run_batch", side_effect=KeyboardInterrupt
+            ):
+                exit_code = main(["--jobs", jobs_path, "--output-dir", tmp, "--poll-interval", "0.001"])
+
+        self.assertEqual(130, exit_code)
+
+    def test_run_batch_reports_totals_when_interrupted(self) -> None:
+        """An interrupt mid-run must surface the totals accumulated so far."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}', '{"id": "j2"}'])
+            args = build_args(jobs_path, tmp, max_inflight=1)
+            jobs = load_jobs(jobs_path, args)
+            manifest = Path(tmp) / "manifest.jsonl"
+
+            def interrupting_sleep(_: float) -> None:
+                raise KeyboardInterrupt
+
+            buffer = io.StringIO()
+            with self.assertRaises(KeyboardInterrupt), redirect_stdout(buffer):
+                run_batch(
+                    FakeApi(polls_before_done=10**6), args, jobs, manifest, sleep=interrupting_sleep
+                )
+
+        self.assertIn("succeeded=0", buffer.getvalue())
+        self.assertIn("failed=0", buffer.getvalue())
+
 
 class ResultIntegrityTests(unittest.TestCase):
     """A job only counts as succeeded when it really produced audio."""
@@ -572,7 +882,7 @@ class AuthenticationTests(unittest.TestCase):
                 exit_code = main([
                     "--jobs", jobs_path,
                     "--output-dir", tmp,
-                    "--poll-interval", "0",
+                    "--poll-interval", "0.001",
                     "--api-key", "sk-test",
                 ])
 
