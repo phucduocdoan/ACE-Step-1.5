@@ -849,7 +849,7 @@ One JSON object per line (blank lines and lines starting with `#` are skipped). 
 <jobs_path>:<line>: field(s) can only be set on the command line, not per job: <field, ...>
 ```
 
-The batch-only flags `jobs`, `max_inflight`, `manifest`, `no_resume` (`BATCH_ONLY_FIELDS`) are likewise rejected per job, since they configure the runner itself, not a single job.
+The batch-only flags `jobs`, `max_inflight`, `manifest`, `no_resume`, `concat` (`BATCH_ONLY_FIELDS`) are likewise rejected per job, since they configure the runner itself, not a single job.
 
 Any other unrecognized key fails with `<jobs_path>:<line>: unknown job field(s): <field, ...>`. Invalid JSON on a line fails with `<jobs_path>:<line>: invalid JSON: <reason>`.
 
@@ -874,7 +874,23 @@ On the next run, jobs whose manifest row has `status == "succeeded"` are skipped
 
 #### Exit codes
 
-`0` if every job succeeded (or there was nothing left to do after resume); `1` if any job failed, or the jobs file failed to load (bad `--jobs` path, invalid JSON, bad `--max-inflight`); `130` on `Ctrl-C` (the manifest reflects whatever had completed so far, and a re-run resumes from it).
+`0` if every job succeeded (or there was nothing left to do after resume); `1` if any job failed, or the jobs file failed to load (bad `--jobs` path, invalid JSON, bad `--max-inflight`), or `--concat` could not produce its output; `130` on `Ctrl-C` (the manifest reflects whatever had completed so far, and a re-run resumes from it).
+
+#### `--concat <output>`: join the whole batch into one file
+
+```bash
+python -m acestep.api_batch --jobs album.jsonl --output-dir out/album \
+  --concat out/album/album.mp3
+```
+
+Runs after the batch and joins every succeeded job's audio into one file with `ffmpeg`, which must be on `PATH`.
+
+- **Order comes from the jobs file, not the manifest.** The manifest is in completion order, and resume appends leftovers after rows that already succeeded, so a resumed run would otherwise produce a different track order than an uninterrupted one. A job with several files (`batch_size > 1`) contributes all of them, in the order the manifest recorded.
+- **It uses the manifest, so it works on its own.** Re-running a finished batch with `--concat` prints `nothing to do` and still writes the album, without regenerating anything — which is how you rebuild it after deleting the output, or add `--concat` to a batch you already ran. Jobs that failed, were never run, or whose audio has since been deleted are reported (`[concat] skipping <id>: ...`) and left out.
+- **Matching formats are stream-copied.** When every input's extension equals the output's, `ffmpeg` copies the streams via its concat demuxer instead of re-encoding. The server returns lossy mp3, so re-encoding would cost a second generation of loss for nothing.
+- **Mixed formats are decoded and re-encoded** through `ffmpeg`'s `concat` *filter*, not the demuxer. The demuxer reads the entire list with the first input's codec, so it feeds (say) mp3 packets to a flac decoder, discards every one of them, and still exits `0` — leaving an album that contains only its first song. The filter opens each input separately, so it genuinely joins them; if their sample rates disagree it fails loudly rather than dropping audio. For an `.mp3` output the re-encode uses `libmp3lame -q:a 2`, because `ffmpeg`'s mp3 default of 128k is audibly lossy on music; for other containers `ffmpeg` picks the encoder.
+- `--concat` needs the audio on disk, so combining it with `--no-download` is rejected before any job is queued.
+- If nothing succeeded, or `ffmpeg` is missing or fails, the error is printed and the run exits `1` — the generated per-job files are still on disk and in the manifest, so re-running with `--concat` retries only the join.
 
 #### `--max-inflight`
 

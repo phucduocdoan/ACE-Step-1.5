@@ -18,9 +18,11 @@ import requests
 from acestep.api_batch import (
     append_manifest_row,
     build_batch_arg_parser,
+    concat_audio_files,
     load_completed_job_ids,
     load_jobs,
     main,
+    ordered_manifest_files,
     run_batch,
 )
 
@@ -1042,6 +1044,403 @@ class ModuleEntryPointTests(unittest.TestCase):
         result = self._run_help("acestep.api_batch")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--jobs", result.stdout)
+
+
+
+def make_audio_files(directory: str, names: list[str]) -> list[Path]:
+    """Create placeholder audio files and return their paths."""
+
+    paths = []
+    for name in names:
+        path = Path(directory) / name
+        path.write_bytes(b"audio")
+        paths.append(path)
+    return paths
+
+
+class OrderedManifestFilesTests(unittest.TestCase):
+    """``ordered_manifest_files`` decides what --concat joins, and in what order."""
+
+    def test_order_follows_the_jobs_file_not_the_manifest(self) -> None:
+        """Completion order is not album order, so the jobs file must win."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            make_audio_files(tmp, ["a.flac", "b.flac"])
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}', '{"id": "j2"}'])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp))
+            manifest = Path(tmp) / "manifest.jsonl"
+            # j2 finished first, so it is the earlier manifest row.
+            append_manifest_row(manifest, {"id": "j2", "status": "succeeded", "files": [f"{tmp}/b.flac"]})
+            append_manifest_row(manifest, {"id": "j1", "status": "succeeded", "files": [f"{tmp}/a.flac"]})
+
+            files = ordered_manifest_files(jobs, manifest)
+
+        self.assertEqual(["a.flac", "b.flac"], [path.name for path in files])
+
+    def test_all_of_a_jobs_files_are_kept_in_recorded_order(self) -> None:
+        """A job with batch_size > 1 contributes every variation it produced."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            make_audio_files(tmp, ["j1_0.flac", "j1_1.flac"])
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp))
+            manifest = Path(tmp) / "manifest.jsonl"
+            append_manifest_row(
+                manifest,
+                {"id": "j1", "status": "succeeded", "files": [f"{tmp}/j1_0.flac", f"{tmp}/j1_1.flac"]},
+            )
+
+            files = ordered_manifest_files(jobs, manifest)
+
+        self.assertEqual(["j1_0.flac", "j1_1.flac"], [path.name for path in files])
+
+    def test_latest_succeeded_row_wins_for_a_rerun_job(self) -> None:
+        """--no-resume leaves two succeeded rows for one job; the album wants the new audio."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            make_audio_files(tmp, ["old.flac", "new.flac"])
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp))
+            manifest = Path(tmp) / "manifest.jsonl"
+            append_manifest_row(manifest, {"id": "j1", "status": "succeeded", "files": [f"{tmp}/old.flac"]})
+            append_manifest_row(manifest, {"id": "j1", "status": "succeeded", "files": [f"{tmp}/new.flac"]})
+
+            files = ordered_manifest_files(jobs, manifest)
+
+        self.assertEqual(["new.flac"], [path.name for path in files])
+
+    def test_failed_and_unrecorded_jobs_are_reported_and_skipped(self) -> None:
+        """A gap in the album must be named, not silently closed up."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            make_audio_files(tmp, ["a.flac"])
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}', '{"id": "j2"}', '{"id": "j3"}'])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp))
+            manifest = Path(tmp) / "manifest.jsonl"
+            append_manifest_row(manifest, {"id": "j1", "status": "succeeded", "files": [f"{tmp}/a.flac"]})
+            append_manifest_row(manifest, {"id": "j2", "status": "failed", "error": "boom"})
+
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                files = ordered_manifest_files(jobs, manifest)
+
+        self.assertEqual(["a.flac"], [path.name for path in files])
+        self.assertIn("skipping j2", buffer.getvalue())
+        self.assertIn("skipping j3", buffer.getvalue())
+
+    def test_a_file_deleted_since_the_run_is_reported_and_skipped(self) -> None:
+        """A stale manifest must not make ffmpeg fail on a path that no longer exists."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            make_audio_files(tmp, ["kept.flac"])
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp))
+            manifest = Path(tmp) / "manifest.jsonl"
+            append_manifest_row(
+                manifest,
+                {"id": "j1", "status": "succeeded", "files": [f"{tmp}/gone.flac", f"{tmp}/kept.flac"]},
+            )
+
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                files = ordered_manifest_files(jobs, manifest)
+
+        self.assertEqual(["kept.flac"], [path.name for path in files])
+        self.assertIn("gone.flac", buffer.getvalue())
+
+    def test_missing_manifest_yields_no_files(self) -> None:
+        """--concat before any run must not raise on a manifest that is not there."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1"}'])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp))
+
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                files = ordered_manifest_files(jobs, Path(tmp) / "absent.jsonl")
+
+        self.assertEqual([], files)
+
+
+class ConcatAudioFilesTests(unittest.TestCase):
+    """``concat_audio_files`` drives ffmpeg, so the command it builds is the contract."""
+
+    @staticmethod
+    def _capture_listing(recorder: dict):
+        """Return a subprocess.run stub that records argv and the concat list."""
+
+        def fake_run(argv, **kwargs):
+            recorder["argv"] = argv
+            recorder["listing"] = Path(argv[argv.index("-i") + 1]).read_text(encoding="utf-8")
+            Path(argv[-1]).write_bytes(b"joined")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return fake_run
+
+    @staticmethod
+    def _capture_argv(recorder: dict):
+        """Return a subprocess.run stub for the filter path, which has no list file."""
+
+        def fake_run(argv, **kwargs):
+            recorder["argv"] = argv
+            Path(argv[-1]).write_bytes(b"joined")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        return fake_run
+
+    def test_empty_input_is_refused_before_ffmpeg_runs(self) -> None:
+        """An album of nothing is a failure, not a zero-byte file."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("acestep.api_batch.subprocess.run") as run:
+                with self.assertRaisesRegex(RuntimeError, "nothing to concatenate"):
+                    concat_audio_files([], Path(tmp) / "album.mp3")
+            run.assert_not_called()
+
+    def test_missing_ffmpeg_is_reported_by_name(self) -> None:
+        """The fix is "install ffmpeg", so the error has to say so."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            files = make_audio_files(tmp, ["a.flac"])
+            with mock.patch("acestep.api_batch.shutil.which", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "ffmpeg"):
+                    concat_audio_files(files, Path(tmp) / "album.mp3")
+
+    def test_inputs_are_passed_to_ffmpeg_via_the_concat_demuxer(self) -> None:
+        """Every input must reach ffmpeg, in order, as an absolute path."""
+
+        recorder: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            files = make_audio_files(tmp, ["a.mp3", "b.mp3"])
+            with mock.patch("acestep.api_batch.subprocess.run", self._capture_listing(recorder)):
+                concat_audio_files(files, Path(tmp) / "album.mp3")
+
+            self.assertEqual(
+                f"file '{tmp}/a.mp3'\nfile '{tmp}/b.mp3'\n",
+                recorder["listing"],
+            )
+
+        self.assertIn("-f", recorder["argv"])
+        self.assertEqual("concat", recorder["argv"][recorder["argv"].index("-f") + 1])
+        # Absolute paths are rejected by the demuxer unless -safe is off.
+        self.assertEqual("0", recorder["argv"][recorder["argv"].index("-safe") + 1])
+
+    def test_a_single_quote_in_a_path_is_escaped_for_the_demuxer(self) -> None:
+        """The list format quotes with single quotes, so a literal one needs escaping.
+
+        Unescaped, ffmpeg reads a truncated path and fails on a file that exists.
+        """
+
+        recorder: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            files = make_audio_files(tmp, ["rock'n'roll.flac"])
+            with mock.patch("acestep.api_batch.subprocess.run", self._capture_listing(recorder)):
+                concat_audio_files(files, Path(tmp) / "album.flac")
+
+            self.assertEqual(f"file '{tmp}/rock'\\''n'\\''roll.flac'\n", recorder["listing"])
+
+    def test_mp3_output_overrides_ffmpegs_lossy_default_bitrate(self) -> None:
+        """ffmpeg defaults mp3 to 128k; music deserves better than the default."""
+
+        recorder: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            files = make_audio_files(tmp, ["a.flac"])
+            with mock.patch("acestep.api_batch.subprocess.run", self._capture_argv(recorder)):
+                concat_audio_files(files, Path(tmp) / "album.mp3")
+
+        self.assertIn("libmp3lame", recorder["argv"])
+        self.assertEqual("2", recorder["argv"][recorder["argv"].index("-q:a") + 1])
+
+    def test_matching_formats_are_copied_rather_than_re_encoded(self) -> None:
+        """The server already returns lossy mp3; re-encoding it loses a generation for nothing."""
+
+        recorder: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            files = make_audio_files(tmp, ["a.mp3", "b.mp3"])
+            with mock.patch("acestep.api_batch.subprocess.run", self._capture_listing(recorder)):
+                concat_audio_files(files, Path(tmp) / "album.mp3")
+
+        self.assertIn("-c", recorder["argv"])
+        self.assertEqual("copy", recorder["argv"][recorder["argv"].index("-c") + 1])
+        self.assertNotIn("libmp3lame", recorder["argv"])
+
+    def test_mixed_input_formats_use_the_concat_filter_not_the_demuxer(self) -> None:
+        """The demuxer silently drops tracks here, so mixed formats must avoid it.
+
+        It reads the whole list with the first input's codec, so a flac decoder
+        gets fed mp3 packets, discards every one of them, and ffmpeg still exits
+        0 with an album missing all but its first song.
+        """
+
+        recorder: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            files = make_audio_files(tmp, ["a.mp3", "b.flac"])
+            with mock.patch("acestep.api_batch.subprocess.run", self._capture_argv(recorder)):
+                concat_audio_files(files, Path(tmp) / "album.mp3")
+
+            argv = recorder["argv"]
+            self.assertNotIn("concat", argv[: argv.index("-filter_complex")])
+            self.assertEqual(
+                ["-i", f"{tmp}/a.mp3", "-i", f"{tmp}/b.flac"],
+                argv[argv.index("-i") : argv.index("-filter_complex")],
+            )
+
+        self.assertEqual(
+            "[0:a][1:a]concat=n=2:v=0:a=1[out]",
+            argv[argv.index("-filter_complex") + 1],
+        )
+        self.assertEqual("[out]", argv[argv.index("-map") + 1])
+        self.assertIn("libmp3lame", argv)
+
+    def test_non_mp3_output_lets_ffmpeg_choose_the_codec(self) -> None:
+        """Inputs it cannot copy and an output it has no bitrate opinion about.
+
+        Mixed inputs rule out a copy, and forcing libmp3lame into a .flac
+        container would fail outright, so ffmpeg picks the encoder itself.
+        """
+
+        recorder: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            files = make_audio_files(tmp, ["a.mp3", "b.flac"])
+            with mock.patch("acestep.api_batch.subprocess.run", self._capture_argv(recorder)):
+                concat_audio_files(files, Path(tmp) / "album.flac")
+
+        self.assertNotIn("libmp3lame", recorder["argv"])
+        self.assertNotIn("-c:a", recorder["argv"])
+        self.assertNotIn("-c", recorder["argv"])
+
+    def test_ffmpeg_failure_surfaces_its_stderr(self) -> None:
+        """ffmpeg's own message is the only useful diagnostic here."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            files = make_audio_files(tmp, ["a.flac"])
+            failure = subprocess.CompletedProcess([], 1, "", "Invalid data found")
+            with mock.patch("acestep.api_batch.subprocess.run", return_value=failure):
+                with self.assertRaisesRegex(RuntimeError, "Invalid data found"):
+                    concat_audio_files(files, Path(tmp) / "album.mp3")
+
+    def test_the_concat_list_is_cleaned_up_even_when_ffmpeg_fails(self) -> None:
+        """The list file is scratch state; leaving it behind litters the output dir."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            files = make_audio_files(tmp, ["a.mp3"])
+            failure = subprocess.CompletedProcess([], 1, "", "boom")
+            with mock.patch("acestep.api_batch.subprocess.run", return_value=failure):
+                with self.assertRaises(RuntimeError):
+                    concat_audio_files(files, Path(tmp) / "album.mp3")
+
+            leftovers = [path.name for path in Path(tmp).glob("*concat*")]
+
+        self.assertEqual([], leftovers)
+
+
+class MainConcatTests(unittest.TestCase):
+    """--concat is wired into ``main`` after the batch, and gates its own exit code."""
+
+    def test_concat_runs_after_a_successful_batch(self) -> None:
+        """The whole point: generate the songs, then hand back one file."""
+
+        api = FakeApi()
+        recorder: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1", "prompt": "a"}', '{"id": "j2", "prompt": "b"}'])
+            album = Path(tmp) / "album.mp3"
+
+            buffer = io.StringIO()
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api), \
+                 mock.patch("acestep.api_batch.subprocess.run",
+                            ConcatAudioFilesTests._capture_listing(recorder)), \
+                 redirect_stdout(buffer):
+                exit_code = main([
+                    "--jobs", jobs_path,
+                    "--output-dir", tmp,
+                    "--poll-interval", "0.001",
+                    "--concat", str(album),
+                ])
+
+            self.assertTrue(album.exists())
+
+        self.assertEqual(0, exit_code)
+        self.assertIn("j1_0", recorder["listing"])
+        self.assertIn("j2_0", recorder["listing"])
+        self.assertIn("[concat] wrote", buffer.getvalue())
+
+    def test_concat_still_runs_when_resume_leaves_nothing_to_generate(self) -> None:
+        """Rebuilding the album from an existing run must not regenerate anything."""
+
+        api = FakeApi()
+        recorder: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            make_audio_files(tmp, ["a.mp3"])
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1", "prompt": "a"}'])
+            manifest_path = Path(tmp) / "manifest.jsonl"
+            append_manifest_row(manifest_path, {"id": "j1", "status": "succeeded", "files": [f"{tmp}/a.mp3"]})
+            album = Path(tmp) / "album.mp3"
+
+            buffer = io.StringIO()
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api), \
+                 mock.patch("acestep.api_batch.subprocess.run",
+                            ConcatAudioFilesTests._capture_listing(recorder)), \
+                 redirect_stdout(buffer):
+                exit_code = main([
+                    "--jobs", jobs_path,
+                    "--output-dir", tmp,
+                    "--manifest", str(manifest_path),
+                    "--poll-interval", "0.001",
+                    "--concat", str(album),
+                ])
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual([], api.submitted)
+        self.assertIn("nothing to do", buffer.getvalue())
+        self.assertIn("a.mp3", recorder["listing"])
+
+    def test_a_failed_concat_makes_the_run_fail(self) -> None:
+        """Exiting 0 with no album would let a script carry on with nothing."""
+
+        api = FakeApi()
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1", "prompt": "a"}'])
+            failure = subprocess.CompletedProcess([], 1, "", "boom")
+
+            buffer = io.StringIO()
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api), \
+                 mock.patch("acestep.api_batch.subprocess.run", return_value=failure), \
+                 redirect_stdout(buffer):
+                exit_code = main([
+                    "--jobs", jobs_path,
+                    "--output-dir", tmp,
+                    "--poll-interval", "0.001",
+                    "--concat", str(Path(tmp) / "album.mp3"),
+                ])
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("boom", buffer.getvalue())
+
+    def test_concat_with_no_download_is_rejected_before_anything_is_queued(self) -> None:
+        """--no-download records URLs, so there would be no local audio to join."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "j1", "prompt": "a"}'])
+
+            buffer = io.StringIO()
+            # A FakeApi rather than a bare MagicMock: if the rejection is ever
+            # dropped, the batch runs to completion against the fake and this
+            # test fails on api.submitted, instead of polling a mock that never
+            # reports a terminal status until the stall timeout expires.
+            api = FakeApi()
+            with mock.patch("acestep.api_batch.requests.Session", return_value=api), redirect_stdout(buffer):
+                exit_code = main([
+                    "--jobs", jobs_path,
+                    "--output-dir", tmp,
+                    "--poll-interval", "0.001",
+                    "--no-download",
+                    "--concat", str(Path(tmp) / "album.mp3"),
+                ])
+
+        self.assertEqual(1, exit_code)
+        self.assertIn("--no-download", buffer.getvalue())
+        self.assertEqual([], api.submitted)
 
 
 if __name__ == "__main__":
