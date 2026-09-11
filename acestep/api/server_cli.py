@@ -8,6 +8,8 @@ from typing import Callable, Optional
 
 import uvicorn
 
+from acestep.api.http.auth import set_api_key
+
 
 def run_api_server_main(
     env_bool: Callable[[str, bool], bool],
@@ -69,6 +71,14 @@ def run_api_server_main(
 
     if args.api_key:
         os.environ["ACESTEP_API_KEY"] = args.api_key
+
+    # ``acestep.api_server`` builds its app while the module is being imported, and
+    # ``main()`` lives in that same module, so the app is already wired up by the
+    # time this runs -- writing the environment now is too late for it. The auth
+    # verifiers read this process-level key on every request, so setting it here is
+    # what actually arms authentication; without it ``--api-key`` is accepted and
+    # silently ignored, leaving the server open.
+    set_api_key(args.api_key)
 
     if args.download_source and args.download_source != "auto":
         os.environ["ACESTEP_DOWNLOAD_SOURCE"] = args.download_source

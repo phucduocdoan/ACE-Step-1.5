@@ -61,14 +61,27 @@ curl -X POST http://localhost:8001/release_task \
 
 ### Configuring API Key
 
-Set via environment variable (this is the only method that currently works — see the warning below):
+Either the `--api-key` flag or the `ACESTEP_API_KEY` environment variable enables it; the
+flag wins when both are set. Leaving both unset keeps the server unauthenticated.
 
 ```bash
+# Flag
+acestep-api --host 127.0.0.1 --port 8001 --api-key your-secret-key
+
+# Environment variable (also picked up from .env)
 export ACESTEP_API_KEY=your-secret-key
-python -m acestep.api_server
+acestep-api --host 127.0.0.1 --port 8001
 ```
 
-> **Known bug: `--api-key` on the server is silently ignored.** `acestep/api_server.py` calls `app = create_app()` at **module import time** (line 359), and `create_app()` reads `ACESTEP_API_KEY` from the environment at that point (line 193). `run_api_server_main()` in `acestep/api/server_cli.py` only sets `os.environ["ACESTEP_API_KEY"]` from the `--api-key` flag *after* that import has already happened (inside `main()`, which runs after `app` is built), so the key it sets is never seen by `create_app()`. `python -m acestep.api_server --api-key your-secret-key` starts the server with auth **disabled**, with no error or warning. Until this is fixed in code, set `ACESTEP_API_KEY` in the environment before launching the server, as shown above.
+With a key set, `/release_task`, `/query_result`, `/v1/stats` and the model management
+endpoints answer `401` unless the request carries it. `/health` stays public so liveness
+probes keep working.
+
+> **`GET /v1/models` is not covered by the key.** The OpenRouter compatibility router is
+> included first (`acestep/api/route_setup.py:71`) and its own `/v1/models` has no auth
+> dependency, so it shadows the authenticated one in
+> `acestep/api/http/model_service_routes.py:179`. The endpoint only exposes model names
+> and their load status, but do not treat the key as sealing off every route.
 
 ---
 

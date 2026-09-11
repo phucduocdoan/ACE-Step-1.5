@@ -6,6 +6,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+from acestep.api.http import auth
 from acestep.api.server_cli import run_api_server_main
 
 
@@ -71,6 +72,39 @@ class ServerCliTests(unittest.TestCase):
 
         self.assertIn(("ACESTEP_INIT_LLM", False), observed)
         self.assertIn(("ACESTEP_NO_INIT", False), observed)
+
+    def test_run_api_server_main_applies_the_api_key_to_the_auth_module(self) -> None:
+        """``--api-key`` has to reach the auth module, not just the environment.
+
+        ``acestep.api_server`` builds its app at import time, and ``main()`` lives
+        in that same module, so the app is already wired with whatever key the
+        environment held *before* this helper writes the flag into it. Setting the
+        env alone therefore leaves authentication disabled while the operator
+        believes the flag turned it on.
+        """
+
+        self.addCleanup(auth.set_api_key, None)
+        auth.set_api_key(None)
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("acestep.api.server_cli.uvicorn.run"):
+                run_api_server_main(
+                    lambda _name, default: default, argv=["--api-key", "secret"]
+                )
+
+        self.assertEqual("secret", auth._api_key)
+
+    def test_run_api_server_main_leaves_auth_disabled_without_an_api_key(self) -> None:
+        """No key anywhere must stay open, so the server keeps working unauthenticated."""
+
+        self.addCleanup(auth.set_api_key, None)
+        auth.set_api_key("stale-from-an-earlier-run")
+
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("acestep.api.server_cli.uvicorn.run"):
+                run_api_server_main(lambda _name, default: default, argv=[])
+
+        self.assertIsNone(auth._api_key)
 
 
 if __name__ == "__main__":
