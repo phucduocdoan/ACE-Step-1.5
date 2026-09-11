@@ -7,6 +7,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -569,4 +570,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    # A batch this slow is usually run with its output redirected to a log, and
+    # block-buffered stdout hides every [submit]/[done] line for minutes at a
+    # time. Buffering is a property of this process, not of main(), which callers
+    # (including the tests) may run against a stdout of their own choosing.
+    sys.stdout.reconfigure(line_buffering=True)
     raise SystemExit(main())

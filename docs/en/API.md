@@ -871,6 +871,7 @@ On the next run, jobs whose manifest row has `status == "succeeded"` are skipped
 - HTTP `429 Server busy: queue is full` is not a failure: the batch simply stops submitting until the queue has room.
 - `--timeout` means something different in batch mode than for `api_client.py`: it is a **stall timeout** — the batch gives up on all currently in-flight jobs if *no job at all* completes within that many seconds (default `1800`s). This is unrelated to how long any individual job may sit in the queue behind others.
 - Stalls are cumulative: after `MAX_CONSECUTIVE_STALLS` (3) consecutive stall windows with zero completions, the batch aborts entirely and fails every remaining pending job too, on the assumption the server is down or unresponsive rather than merely slow.
+- `Ctrl-C` stops the client, not the server. It exits within a second, printing `[interrupted] succeeded=N failed=N pending=N inflight=N`, and the manifest holds every job that had finished. The jobs still in flight keep generating server-side, though: the client is not tracking them any more, so resuming re-submits them as new tasks and the server does that work twice. Interrupting a batch with `--max-inflight 8` outstanding costs up to 8 duplicated generations.
 
 #### Exit codes
 
