@@ -910,6 +910,16 @@ Runs after the batch and joins every succeeded job's audio into one file with `f
 
 Caps how many submitted-but-not-yet-finished jobs the batch keeps outstanding (default `8`). **This does not parallelize generation.** The server that `create_app()` builds runs a single worker (`WORKER_COUNT = int(os.getenv("ACESTEP_QUEUE_WORKERS", "1"))` in `acestep/api_server.py`), so every job is generated strictly serially on one GPU regardless of `--max-inflight`. Raising it only lets the batch keep more jobs queued server-side at once, which avoids repeatedly hitting HTTP 429 and re-submitting; it buys queue depth, not throughput.
 
+#### How long a bulk run takes
+
+Measured on this machine (single H100, `inference_steps: 8`, `audio_duration: 180`,
+default `--max-inflight 8`) while generating a 20-track album: **a 3-minute track takes
+about 16s once the models are warm** (29 generations, min 14s, median 16s, max 41s). The
+first request after startup is far slower — a one-off probe measured 101s — because it
+includes loading the models, so do not size a run from it. At that rate 20 tracks of 3
+minutes each cost roughly 5-6 minutes of GPU for an hour of audio, and the run scales
+linearly: generation is strictly serial on one worker (see `--max-inflight` above).
+
 #### `batch_size` vs. separate jobs
 
 `batch_size: N` inside one job produces **N variations of that job's one prompt**, not N different songs — the LM/DiT generate `N` samples from the same `prompt`/`lyrics` in one task. It does not help you generate many different songs faster; for that, use one job per song and let the batch runner queue them.
