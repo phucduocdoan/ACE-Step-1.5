@@ -17,6 +17,7 @@ import requests
 
 from acestep.api_batch import (
     append_manifest_row,
+    base_seed,
     build_batch_arg_parser,
     concat_audio_files,
     load_completed_job_ids,
@@ -1441,6 +1442,102 @@ class MainConcatTests(unittest.TestCase):
         self.assertEqual(1, exit_code)
         self.assertIn("--no-download", buffer.getvalue())
         self.assertEqual([], api.submitted)
+
+
+class VariantTests(unittest.TestCase):
+    """--variants turns one entry into several takes on pinned seeds."""
+
+    def test_variants_expand_into_one_job_per_consecutive_seed(self) -> None:
+        """Each take needs its own task and its own seed, not one batched request."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "drift", "prompt": "ambient", "seed": 100}'])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp, variants=3))
+
+        self.assertEqual(["drift-s100", "drift-s101", "drift-s102"], [job.job_id for job in jobs])
+        self.assertEqual(["100", "101", "102"], [job.args.seed for job in jobs])
+
+    def test_a_single_variant_leaves_the_job_untouched(self) -> None:
+        """The default must not rename jobs, or every existing manifest stops resuming."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "drift", "prompt": "ambient"}'])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp))
+
+        self.assertEqual(["drift"], [job.job_id for job in jobs])
+        self.assertIsNone(jobs[0].args.seed)
+
+    def test_an_unseeded_entry_produces_the_same_takes_every_run(self) -> None:
+        """The API never reports the seed it chose, so an unseeded take would be
+        unrecoverable; deriving the seed from the ID keeps a preset reproducible."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "drift", "prompt": "ambient"}'])
+            args = build_args(jobs_path, tmp, variants=2)
+            first = [job.job_id for job in load_jobs(jobs_path, args)]
+            second = [job.job_id for job in load_jobs(jobs_path, args)]
+
+        self.assertEqual(first, second)
+        self.assertEqual(2, len(set(first)))
+        self.assertTrue(all(job_id.startswith("drift-s") for job_id in first))
+
+    def test_variants_can_be_set_per_job(self) -> None:
+        """A preset file should be able to ask for more takes of one entry only."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, [
+                '{"id": "keeper", "prompt": "ambient", "seed": 7, "variants": 2}',
+                '{"id": "single", "prompt": "chill"}',
+            ])
+            jobs = load_jobs(jobs_path, build_args(jobs_path, tmp))
+
+        self.assertEqual(["keeper-s7", "keeper-s8", "single"], [job.job_id for job in jobs])
+
+    def test_a_seed_list_with_variants_is_rejected(self) -> None:
+        """Comma seeds and variants both mean "several takes"; silently picking one
+        of the two would produce a run the user never asked for."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "drift", "prompt": "a", "seed": "1,2"}'])
+            args = build_args(jobs_path, tmp, variants=2)
+            with self.assertRaisesRegex(ValueError, "single seed"):
+                load_jobs(jobs_path, args)
+
+    def test_a_take_name_colliding_with_another_entry_is_rejected(self) -> None:
+        """Resume matches on the job ID, so a collision makes one take un-resumable."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, [
+                '{"id": "drift", "prompt": "a", "seed": 5, "variants": 2}',
+                '{"id": "drift-s6", "prompt": "b"}',
+            ])
+            with self.assertRaisesRegex(ValueError, "duplicate job id 'drift-s6'"):
+                load_jobs(jobs_path, build_args(jobs_path, tmp))
+
+    def test_base_seed_treats_the_random_sentinel_as_unset(self) -> None:
+        """seed -1 asks the server to choose, which is exactly what variants avoid."""
+
+        self.assertEqual(base_seed("drift", None), base_seed("drift", -1))
+
+
+class ManifestSeedTests(unittest.TestCase):
+    """The manifest is the only record of which seed made which file."""
+
+    def test_a_succeeded_row_records_the_seed_that_produced_it(self) -> None:
+        """/query_result never returns the seed, so an unrecorded one is lost."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            jobs_path = write_jobs_file(tmp, ['{"id": "drift", "prompt": "ambient", "seed": 42}'])
+            args = build_args(jobs_path, tmp)
+            jobs = load_jobs(jobs_path, args)
+            manifest_path = Path(tmp) / "manifest.jsonl"
+            api = FakeApi()
+
+            succeeded, _failed = run_batch(api, args, jobs, manifest_path, sleep=lambda _: None)
+            rows = read_manifest(manifest_path)
+
+        self.assertEqual(1, succeeded)
+        self.assertEqual(42, rows[0]["seed"])
 
 
 if __name__ == "__main__":

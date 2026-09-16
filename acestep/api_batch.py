@@ -75,6 +75,17 @@ def build_batch_arg_parser() -> argparse.ArgumentParser:
         help="Re-run jobs already recorded as succeeded in the manifest.",
     )
     parser.add_argument(
+        "--variants",
+        type=int,
+        default=1,
+        help=(
+            "Generate this many takes of every job, one task each, on consecutive "
+            "seeds. Settable per job. The seed goes into the job id and the "
+            "manifest, which is the only way to get a take back: the API does not "
+            "report the seed it picked for itself."
+        ),
+    )
+    parser.add_argument(
         "--concat",
         default=None,
         help=(
@@ -109,6 +120,49 @@ def auto_job_id(overrides: dict[str, Any], taken: set[str]) -> str:
     while f"{base}-{suffix}" in taken:
         suffix += 1
     return f"{base}-{suffix}"
+
+
+def base_seed(job_id: str, seed: Any) -> int:
+    """Return the seed of a variant run's first take.
+
+    An unseeded job is derived from its own ID rather than left to the server, so
+    re-running the same preset reproduces the same takes instead of drifting into
+    a fresh set every time.
+    """
+
+    text = "" if seed is None else str(seed).strip()
+    # -1 is the API's "pick a random seed" sentinel, so it is as good as unset.
+    if text in {"", "-1"}:
+        return int(hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:8], 16)
+    if "," in text:
+        raise ValueError("variants needs a single seed, not a seed list")
+    try:
+        return int(text)
+    except ValueError:
+        raise ValueError(f"variants needs an integer seed, got '{text}'") from None
+
+
+def expand_variants(job_id: str, args: argparse.Namespace) -> list[Job]:
+    """Split one entry into its takes, one pinned seed each.
+
+    ``/query_result`` does not report the seed the server used, so a take made on
+    a server-chosen seed can never be regenerated. Pinning the seed here, and
+    naming the job after it, is what makes a take recoverable later.
+    """
+
+    variants = int(args.variants)
+    if variants < 1:
+        raise ValueError("variants must be >= 1")
+    if variants == 1:
+        return [Job(job_id=job_id, args=args)]
+    first = base_seed(job_id, args.seed)
+    return [
+        Job(
+            job_id=f"{job_id}-s{first + offset}",
+            args=argparse.Namespace(**{**vars(args), "seed": str(first + offset)}),
+        )
+        for offset in range(variants)
+    ]
 
 
 def load_jobs(jobs_path: str, defaults: argparse.Namespace) -> list[Job]:
@@ -151,8 +205,21 @@ def load_jobs(jobs_path: str, defaults: argparse.Namespace) -> list[Job]:
                 f"{jobs_path}:{line_number}: unknown job field(s): {', '.join(unknown)}"
             )
 
+        job_args = argparse.Namespace(**{**vars(defaults), **overrides})
+        try:
+            takes = expand_variants(job_id, job_args)
+        except ValueError as exc:
+            raise ValueError(f"{jobs_path}:{line_number}: {exc}") from exc
+        for take in takes:
+            # Resume matches on the job ID, so a take whose name collides with
+            # another entry would make one of them un-resumable.
+            if take.job_id in seen:
+                raise ValueError(f"{jobs_path}:{line_number}: duplicate job id '{take.job_id}'")
+            seen.add(take.job_id)
+        # The un-suffixed ID is reserved too, so a later entry cannot claim a name
+        # this entry's takes were derived from.
         seen.add(job_id)
-        jobs.append(Job(job_id=job_id, args=argparse.Namespace(**{**vars(defaults), **overrides})))
+        jobs.extend(takes)
     return jobs
 
 
@@ -338,7 +405,12 @@ def run_batch(
     consecutive_stalls = 0
 
     def record(job: Job, row: dict[str, Any]) -> None:
-        append_manifest_row(manifest_path, {"id": job.job_id, "prompt": job.args.prompt, **row})
+        # The seed is recorded because the API never gives it back: a row with a
+        # null seed marks a take the server seeded itself, which cannot be redone.
+        append_manifest_row(
+            manifest_path,
+            {"id": job.job_id, "prompt": job.args.prompt, "seed": job.args.seed, **row},
+        )
 
     try:
         while pending or inflight:
