@@ -12,6 +12,7 @@ from typing import Optional
 import requests
 
 from acestep.api_client import (
+    build_arg_parser,
     build_release_task_payload,
     download_audio_files,
     infer_output_suffix,
@@ -24,13 +25,27 @@ from acestep.api_client import (
 )
 
 
+def make_args(**overrides: object) -> argparse.Namespace:
+    """Build CLI args the way the parser would, then apply the test's overrides.
+
+    Handwritten namespaces rot silently: adding a flag makes the code under test
+    read an attribute the fixture never set, and the test then fails for a reason
+    unrelated to what it checks.
+    """
+
+    args = build_arg_parser().parse_args([])
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
 class ApiClientValidationTests(unittest.TestCase):
     """Validate CLI argument rules for task-specific API modes."""
 
     def test_cover_requires_src_audio(self) -> None:
         """Cover-family tasks should require a source audio file."""
 
-        args = argparse.Namespace(
+        args = make_args(
             task_type="cover",
             src_audio=None,
             batch_size=1,
@@ -43,7 +58,7 @@ class ApiClientValidationTests(unittest.TestCase):
     def test_repaint_requires_end_time(self) -> None:
         """Repaint mode should require an explicit repaint end boundary."""
 
-        args = argparse.Namespace(
+        args = make_args(
             task_type="repaint",
             src_audio="input.wav",
             batch_size=1,
@@ -56,7 +71,7 @@ class ApiClientValidationTests(unittest.TestCase):
     def test_poll_interval_must_be_positive(self) -> None:
         """A zero or negative poll interval must be rejected before any network call."""
 
-        args = argparse.Namespace(
+        args = make_args(
             task_type="text2music",
             src_audio=None,
             batch_size=1,
@@ -73,7 +88,7 @@ class ApiClientPayloadTests(unittest.TestCase):
     def test_build_release_task_payload_disables_random_seed_when_seed_given(self) -> None:
         """Explicit seeds should set ``use_random_seed`` false in the payload."""
 
-        args = argparse.Namespace(
+        args = make_args(
             task_type="text2music",
             prompt="hello",
             lyrics="",
@@ -99,7 +114,7 @@ class ApiClientPayloadTests(unittest.TestCase):
     def test_build_release_task_payload_includes_gradio_repaint_defaults(self) -> None:
         """Repaint requests should send the same default mode/strength as Gradio."""
 
-        args = argparse.Namespace(
+        args = make_args(
             task_type="repaint",
             prompt="repair the chorus",
             lyrics="[Instrumental]",
@@ -470,6 +485,39 @@ class PollTaskResultTests(unittest.TestCase):
                 sleep=lambda _: None,
                 monotonic=lambda: 0.0,
             )
+
+
+class ApiClientMusicalAttributeTests(unittest.TestCase):
+    """Tempo, key and time signature must reach the request unchanged."""
+
+    def test_payload_pins_tempo_key_and_time_signature_when_given(self) -> None:
+        """A preset that fixes these needs them in the payload, or it is not a preset."""
+
+        args = make_args(bpm=62, key_scale="D minor", time_signature="4/4")
+        payload = build_release_task_payload(args)
+        self.assertEqual(62, payload["bpm"])
+        self.assertEqual("D minor", payload["key_scale"])
+        self.assertEqual("4/4", payload["time_signature"])
+
+    def test_payload_omits_tempo_and_key_when_unset(self) -> None:
+        """The server infers these; sending empty values would override that with nothing."""
+
+        payload = build_release_task_payload(make_args())
+        self.assertNotIn("bpm", payload)
+        self.assertNotIn("key_scale", payload)
+        self.assertNotIn("time_signature", payload)
+        self.assertFalse(payload["use_format"])
+
+    def test_use_format_reaches_the_payload(self) -> None:
+        """LM rewriting changes the caption actually sung, so it must be explicit."""
+
+        self.assertTrue(build_release_task_payload(make_args(use_format=True))["use_format"])
+
+    def test_non_positive_bpm_is_rejected_before_any_network_call(self) -> None:
+        """A zero tempo is a typo, and the server would silently ignore it."""
+
+        with self.assertRaisesRegex(ValueError, "--bpm must be > 0"):
+            validate_args(make_args(bpm=0))
 
 
 if __name__ == "__main__":

@@ -36,6 +36,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-format", default="mp3", help="Output format: mp3/flac/wav/opus/aac/wav32.")
     parser.add_argument("--seed", default=None, help="Optional seed or comma-separated seeds.")
     parser.add_argument("--vocal-language", default="en", help="Lyrics language code.")
+    parser.add_argument(
+        "--bpm",
+        type=int,
+        default=None,
+        help="Target tempo, 30-300. The server picks one when unset.",
+    )
+    parser.add_argument("--key-scale", default="", help='Musical key, for example "D Minor".')
+    parser.add_argument("--time-signature", default="", help='Time signature, for example "4/4".')
+    parser.add_argument(
+        "--use-format",
+        action="store_true",
+        help="Let the LM rewrite the caption and lyrics before generating.",
+    )
     parser.add_argument("--repainting-start", type=float, default=0.0, help="Repaint region start in seconds.")
     parser.add_argument("--repainting-end", type=float, default=None, help="Repaint region end in seconds.")
     parser.add_argument(
@@ -75,6 +88,8 @@ def validate_args(args: argparse.Namespace) -> None:
 
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
+    if args.bpm is not None and args.bpm <= 0:
+        raise ValueError("--bpm must be > 0")
     if args.poll_interval <= 0:
         raise ValueError("--poll-interval must be > 0")
     if args.task_type in {"cover", "cover-nofsq", "repaint"} and not args.src_audio:
@@ -97,7 +112,17 @@ def build_release_task_payload(args: argparse.Namespace) -> dict[str, Any]:
         "guidance_scale": args.guidance_scale,
         "audio_format": args.audio_format,
         "repainting_start": args.repainting_start,
+        "use_format": args.use_format,
     }
+    # The server infers tempo and key when they are absent, so only pin them when
+    # the caller actually asked for a value; sending an empty one would override
+    # that inference with nothing.
+    if args.bpm is not None:
+        payload["bpm"] = args.bpm
+    if args.key_scale:
+        payload["key_scale"] = args.key_scale
+    if args.time_signature:
+        payload["time_signature"] = args.time_signature
     if args.task_type == "repaint":
         payload["repaint_mode"] = args.repaint_mode
         payload["repaint_strength"] = args.repaint_strength
