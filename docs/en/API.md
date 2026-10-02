@@ -812,6 +812,7 @@ python -m acestep.api_client --base-url http://127.0.0.1:8001 --api-key your-sec
 Every flag comes from `build_arg_parser()` in `acestep/api_client.py`; run `python -m acestep.api_client --help` for the exhaustive, current list. Key behaviors:
 
 - `--seed` accepts a single seed or a comma-separated list; setting it also forces `use_random_seed=false` in the payload.
+- `--bpm`, `--key-scale` and `--time-signature` pin the musical attributes documented in [4.2](#42-request-parameters). They are only put in the payload when you actually set one: an unset flag leaves the server's own inference alone, rather than overriding it with an empty value. `--use-format` turns on the LM caption/lyrics rewrite (`use_format` in the payload).
 - `--src-audio` is required when `--task-type` is `cover`, `cover-nofsq`, or `repaint`; `--repainting-end` is additionally required for `repaint`. These are enforced by `validate_args()` before any network call.
 - `--no-download` prints the returned audio URLs instead of downloading them.
 - `--timeout` (default `900`s) is how long this single job is allowed to poll before the client gives up and raises `TimeoutError`. `--poll-interval` (default `2`s) is the wait between polls.
@@ -851,6 +852,11 @@ One JSON object per line (blank lines and lines starting with `#` are skipped). 
 | `audio_format` | string | `"mp3"` | `mp3`/`flac`/`wav`/`opus`/`aac`/`wav32` |
 | `seed` | string/int | `null` | Seed or comma-separated seeds; also sets `use_random_seed=false` |
 | `vocal_language` | string | `"en"` | Lyrics language code |
+| `bpm` | int | `null` | Target tempo, 30-300. Only sent when set; otherwise the server infers it |
+| `key_scale` | string | `""` | Musical key, e.g. `"D Minor"`. Only sent when non-empty |
+| `time_signature` | string | `""` | Time signature, e.g. `"4/4"`. Only sent when non-empty |
+| `use_format` | bool | `false` | Let the LM rewrite the caption and lyrics before generating |
+| `variants` | int | `1` | Takes of this job, one per consecutive seed — see [`--variants`](#--variants-n-several-takes-of-the-same-job) |
 | `repainting_start` | float | `0.0` | Repaint region start (seconds) |
 | `repainting_end` | float | `null` | Repaint region end (seconds); required for `repaint` |
 | `repaint_mode` | string | `"balanced"` | `conservative`/`balanced`/`aggressive` |
@@ -872,9 +878,27 @@ Any other unrecognized key fails with `<jobs_path>:<line>: unknown job field(s):
 - If `"id"` is omitted, the ID is derived by hashing the job's own JSON content (`job-<8 hex chars>` from a SHA-256 of the sorted-key JSON, `auto_job_id()` in `acestep/api_batch.py`), not the line's position. This is deliberate: resume matches by job ID, and a positional ID like `job-0003` would silently rebind to a different job as soon as a line is inserted or removed above it. Content hashing keeps a job's identity attached to what it actually asks for; byte-identical lines get a `-2`, `-3`, ... suffix.
 - IDs (explicit or auto) also become the filename prefix for downloaded audio and the `id` field in the manifest.
 
+#### `--variants <n>`: several takes of the same job
+
+Runs each job `n` times on consecutive seeds, as `n` separate tasks, and appends the seed to the job ID (`drift` with `--variants 3` becomes `drift-s1010`, `drift-s1011`, `drift-s1012`). Settable per job as `"variants"`.
+
+This exists for reproducibility, not convenience. `/query_result` does not report the seed the server chose, so a take generated on a server-picked seed is gone the moment you lose the file — you cannot ask for it again. Pinning the seed client-side and writing it into both the job ID and the manifest is what makes a take recoverable.
+
+A job with no `seed` of its own does not fall back to the server: its first seed is derived from its own job ID, so re-running the same file reproduces the same takes instead of drifting into a fresh set each time. `"seed": -1` counts as unset, since that is the API's "pick a random seed" sentinel.
+
+Constraints:
+
+- A seed *list* (`"seed": "1,2,3"`) cannot be combined with `variants > 1`; it fails with `variants needs a single seed, not a seed list`. A list means several seeds inside one task, which is `batch_size`'s job.
+- Take names must not collide with another entry, or resume (which matches on job ID) would skip the wrong one. The un-suffixed ID stays reserved too, so a later entry cannot claim a name an earlier entry's takes were derived from.
+- `variants` multiplies `batch_size`: `"variants": 3, "batch_size": 2` is 3 tasks of 2 samples, 6 files in total.
+
+Ready-made examples live in [`examples/presets/`](../../examples/presets): `ambient-instrumental.jsonl` (8 takes) and `chill-vocal.jsonl` (6 takes), each entry pinning tempo, key, duration and seed.
+
 #### The manifest
 
-Defaults to `<output-dir>/manifest.jsonl`, or `--manifest <path>`. One JSON object appended per completed/failed job, flushed immediately, so it is safe to read (or interrupt the batch) at any time. Fields per row: `id`, `prompt`, `status` (`"succeeded"`/`"failed"`), plus `task_id`, `files` (on success), or `error` (on failure).
+Defaults to `<output-dir>/manifest.jsonl`, or `--manifest <path>`. One JSON object appended per completed/failed job, flushed immediately, so it is safe to read (or interrupt the batch) at any time. Fields per row: `id`, `prompt`, `seed`, `status` (`"succeeded"`/`"failed"`), plus `task_id`, `files` (on success), or `error` (on failure).
+
+`seed` is recorded because `/query_result` never gives it back (see [5.3](#53-response-example): the response carries `metas`, not the seed the server picked). A row with a null `seed` therefore marks a take that can never be regenerated — only the audio file itself survives.
 
 On the next run, jobs whose manifest row has `status == "succeeded"` are skipped automatically (resume). Pass `--no-resume` to re-run everything, including previously succeeded jobs, ignoring the manifest.
 

@@ -171,6 +171,10 @@ curl -s -H "$K" "$B$URL" -o bai1.mp3
 | `seed` | `-1` | Cố định seed để tái tạo lại đúng bài đó; nhớ đặt `use_random_seed: false` |
 | `batch_size` | `2` | Số bản sinh ra **từ cùng một prompt**. Tối đa 8 |
 | `thinking` | `false` | Bật LM 5Hz sinh audio code trước, nhạc thường khá hơn nhưng chậm hơn |
+| `bpm` | tự chọn | Nhịp độ, 30-300. Không đặt thì server tự suy ra |
+| `key_scale` | `""` | Giọng, ví dụ `"D Minor"`, `"Am"`. Bí danh: `keyscale`, `keyScale` |
+| `time_signature` | `""` | Nhịp, ví dụ `"4/4"`, `"3/4"`, `"6/8"`. Bí danh: `timesignature` |
+| `use_format` | `false` | Cho LM viết lại caption và lời trước khi sinh. Bí danh: `format` |
 | `model` | mặc định | Chọn model DiT khác; xem danh sách bằng `GET /v1/models` |
 | `guidance_scale` | `7.0` | Chỉ có tác dụng với model base, không tác dụng với turbo |
 
@@ -200,6 +204,22 @@ python -m acestep.api_client \
 Mặc định: `--base-url http://127.0.0.1:8001`, `--output-dir api_outputs`,
 `--poll-interval 2`, `--timeout 900` (giây, là thời gian tối đa chờ **một** bài).
 
+**Ghim nhịp độ và giọng.** `--bpm`, `--key-scale`, `--time-signature` tương ứng với các
+tham số ở mục 5. Cờ nào không đặt thì **không** được gửi lên, nên server vẫn tự suy ra như
+cũ — đặt rỗng không có nghĩa là "bỏ trống", mà là không đụng tới. `--use-format` bật phần
+LM viết lại caption và lời.
+
+```bash
+python -m acestep.api_client \
+  --prompt "ambient instrumental, slow synth pads, no percussion" \
+  --lyrics "[Instrumental]" \
+  --bpm 62 --key-scale "D Minor" --time-signature "4/4" \
+  --audio-duration 240 --seed 1010
+```
+
+Muốn nhạc không lời thì truyền `[Instrumental]` hoặc các thẻ cấu trúc (`[Intro]`,
+`[Outro]`), **không** để `--lyrics` rỗng.
+
 Thoát với mã `0` nếu thành công, `1` nếu lỗi (kể cả hết giờ), kèm dòng `error: ...`.
 
 ---
@@ -224,11 +244,12 @@ dễ đọc và tên file dễ tra hơn.
 
 **Tên khóa hợp lệ trong file job khác với tên tham số của REST API.** Chúng là tên cờ dòng
 lệnh bỏ dấu gạch, và **không có bí danh**: phải viết `audio_duration`, viết `duration` sẽ
-bị từ chối. Có đúng 18 khóa:
+bị từ chối. Có đúng 23 khóa:
 
-`audio_duration`, `audio_format`, `batch_size`, `guidance_scale`, `inference_steps`,
-`lyrics`, `model`, `prompt`, `reference_audio`, `repaint_mode`, `repaint_strength`,
-`repainting_end`, `repainting_start`, `seed`, `src_audio`, `task_type`, `thinking`,
+`audio_duration`, `audio_format`, `batch_size`, `bpm`, `guidance_scale`,
+`inference_steps`, `key_scale`, `lyrics`, `model`, `prompt`, `reference_audio`,
+`repaint_mode`, `repaint_strength`, `repainting_end`, `repainting_start`, `seed`,
+`src_audio`, `task_type`, `thinking`, `time_signature`, `use_format`, `variants`,
 `vocal_language`.
 
 Khóa lạ bị báo lỗi kèm số dòng **trước khi** gửi bất cứ gì lên server, nên sai chính tả
@@ -249,8 +270,33 @@ Kết quả: mỗi bài một file trong `./album/`, cộng thêm `album.mp3` l�
 
 ### Những điều cần biết
 
+**Nhiều bản của cùng một bài — `--variants`.** Đặt `--variants 3` (hoặc `"variants": 3`
+trong từng dòng job) thì mỗi job chạy 3 lần trên 3 seed liên tiếp, thành 3 task riêng, và
+seed được gắn vào tên job: `drift` thành `drift-s1010`, `drift-s1011`, `drift-s1012`.
+
+Đây là chuyện tái tạo, không phải tiện tay. `/query_result` **không** trả về seed mà server
+đã chọn — kết quả ở mục 4 bước 3 chỉ có `metas` (bpm, giọng, nhịp, độ dài), không có seed. Nghĩa là một bản sinh ra bằng seed của server, mất
+file là mất luôn, không xin lại được. Ghim seed từ phía client rồi ghi vào cả tên job lẫn
+manifest chính là thứ làm cho một bản lấy lại được.
+
+Job không có `seed` thì **không** phó mặc cho server: seed đầu được suy ra từ chính tên job,
+nên chạy lại cùng một file sẽ ra đúng những bản cũ chứ không trôi sang bộ mới. `"seed": -1`
+coi như không đặt, vì đó là ký hiệu "chọn seed ngẫu nhiên" của API.
+
+Vài ràng buộc: không dùng chung được với *danh sách* seed (`"seed": "1,2,3"`) — báo
+`variants needs a single seed, not a seed list`, vì danh sách là nhiều seed trong **một**
+task, đó là việc của `batch_size`. Tên bản sinh ra cũng không được trùng với job khác trong
+file, vì resume dò theo tên job. Và `variants` nhân với `batch_size`: `variants 3` cộng
+`batch_size 2` là 3 task × 2 mẫu = 6 file.
+
+Có sẵn hai bộ mẫu trong [`examples/presets/`](../../examples/presets):
+`ambient-instrumental.jsonl` (8 bản) và `chill-vocal.jsonl` (6 bản), mỗi dòng đã ghim sẵn
+nhịp độ, giọng, độ dài và seed.
+
 **Chạy tiếp sau khi đứt.** Mỗi job xong được ghi ngay một dòng vào
-`./album/manifest.jsonl`. Đứt giữa chừng thì chạy **đúng lệnh cũ** — nó đọc manifest, bỏ
+`./album/manifest.jsonl`, trong đó có cả `seed` — đây là chỗ duy nhất lưu lại seed, nên
+một dòng có `seed` rỗng là một bản không bao giờ sinh lại được. Đứt giữa chừng thì chạy
+**đúng lệnh cũ** — nó đọc manifest, bỏ
 qua bài đã xong, làm tiếp phần còn lại. Muốn làm lại từ đầu thì thêm `--no-resume`.
 
 **Ghép lại mà không sinh lại.** Chạy lại lệnh trên khi mọi bài đã xong thì in
