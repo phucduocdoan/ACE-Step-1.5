@@ -36,6 +36,9 @@ def build_generate_music_request(
     if track_classes is not None and isinstance(track_classes, str):
         track_classes = [track_classes]
 
+    # dcw_enabled is tri-state: unset means "let the model config decide".
+    dcw_enabled = None if parser.get("dcw_enabled") is None else parser.bool("dcw_enabled")
+
     payload = dict(
         prompt=parser.str("prompt"),
         global_caption=parser.str("global_caption"),
@@ -81,6 +84,11 @@ def build_generate_music_request(
         cfg_interval_end=parser.float("cfg_interval_end", 1.0),
         infer_method=parser.str("infer_method", "ode"),
         shift=parser.float("shift", 3.0),
+        dcw_enabled=dcw_enabled,
+        dcw_mode=parser.str("dcw_mode", "double"),
+        dcw_scaler=parser.float("dcw_scaler", 0.05),
+        dcw_high_scaler=parser.float("dcw_high_scaler", 0.02),
+        dcw_wavelet=parser.str("dcw_wavelet", "haar"),
         audio_format=parser.str("audio_format", "mp3"),
         use_tiled_decode=parser.bool("use_tiled_decode", True),
         lm_model_path=parser.str("lm_model_path") or None,

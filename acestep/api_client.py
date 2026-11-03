@@ -63,6 +63,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Repaint strength. Matches the Gradio default.",
     )
+    parser.add_argument(
+        "--dcw-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Force DCW on or off. Unset lets the model config decide (on for turbo).",
+    )
+    parser.add_argument(
+        "--dcw-mode",
+        default=None,
+        choices=("low", "high", "double", "pix"),
+        help="DCW band mode. Server default: double.",
+    )
+    parser.add_argument("--dcw-scaler", type=float, default=None, help="DCW low-band scaler. Server default: 0.05.")
+    parser.add_argument(
+        "--dcw-high-scaler",
+        type=float,
+        default=None,
+        help="DCW high-band scaler, used only in double mode. Server default: 0.02.",
+    )
+    parser.add_argument("--dcw-wavelet", default=None, help="PyWavelets basis, e.g. haar, db4, sym8.")
     parser.add_argument("--poll-interval", type=float, default=2.0, help="Polling interval in seconds.")
     parser.add_argument("--timeout", type=float, default=900.0, help="Polling timeout in seconds.")
     parser.add_argument("--output-dir", default="api_outputs", help="Directory for downloaded audio.")
@@ -135,6 +155,11 @@ def build_release_task_payload(args: argparse.Namespace) -> dict[str, Any]:
     if args.seed is not None:
         payload["seed"] = args.seed
         payload["use_random_seed"] = False
+    # Each DCW field is omitted unless set, so the server keeps its own default.
+    for name in ("dcw_enabled", "dcw_mode", "dcw_scaler", "dcw_high_scaler", "dcw_wavelet"):
+        value = getattr(args, name)
+        if value is not None:
+            payload[name] = value
     return payload
 
 

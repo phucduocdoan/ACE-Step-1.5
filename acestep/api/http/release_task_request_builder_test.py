@@ -14,10 +14,10 @@ class _FakeParser:
 
         self._values = values
 
-    def get(self, key: str):
+    def get(self, key: str, default=None):
         """Return raw value for ``key`` from parser payload."""
 
-        return self._values.get(key)
+        return self._values.get(key, default)
 
     def str(self, key: str, default: str = "") -> str:
         """Return string value for ``key`` with default fallback."""
@@ -133,6 +133,52 @@ class ReleaseTaskRequestBuilderTests(unittest.TestCase):
 
         self.assertEqual("<|audio_code_7|>", request.audio_code_string)
         self.assertAlmostEqual(0.6, request.cover_noise_strength)
+
+    def test_build_request_omits_dcw_enabled_as_none_for_core_to_resolve(self):
+        """An absent dcw_enabled must stay None so the model config decides."""
+
+        parser = _FakeParser({"prompt": "hello"})
+        request = build_generate_music_request(
+            parser=parser,
+            request_model_cls=lambda **kwargs: SimpleNamespace(**kwargs),
+            default_dit_instruction="default-instruction",
+            lm_default_temperature=0.85,
+            lm_default_cfg_scale=2.5,
+            lm_default_top_p=0.9,
+        )
+
+        self.assertIsNone(request.dcw_enabled)
+        self.assertEqual("double", request.dcw_mode)
+        self.assertAlmostEqual(0.05, request.dcw_scaler)
+        self.assertAlmostEqual(0.02, request.dcw_high_scaler)
+        self.assertEqual("haar", request.dcw_wavelet)
+
+    def test_build_request_forwards_explicit_dcw_settings(self):
+        """Client-supplied DCW settings must reach the request model."""
+
+        parser = _FakeParser(
+            {
+                "dcw_enabled": "false",
+                "dcw_mode": "low",
+                "dcw_scaler": 0.01,
+                "dcw_high_scaler": 0.003,
+                "dcw_wavelet": "db4",
+            }
+        )
+        request = build_generate_music_request(
+            parser=parser,
+            request_model_cls=lambda **kwargs: SimpleNamespace(**kwargs),
+            default_dit_instruction="default-instruction",
+            lm_default_temperature=0.85,
+            lm_default_cfg_scale=2.5,
+            lm_default_top_p=0.9,
+        )
+
+        self.assertFalse(request.dcw_enabled)
+        self.assertEqual("low", request.dcw_mode)
+        self.assertAlmostEqual(0.01, request.dcw_scaler)
+        self.assertAlmostEqual(0.003, request.dcw_high_scaler)
+        self.assertEqual("db4", request.dcw_wavelet)
 
 
 if __name__ == "__main__":
