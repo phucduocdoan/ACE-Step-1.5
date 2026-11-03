@@ -11,6 +11,13 @@ from acestep.constants import DEFAULT_DIT_INSTRUCTION
 # (batch operations are supported up to 8 songs)
 MAX_BATCH_SIZE = 8
 
+# Maximum inference steps the turbo DiTs accept. Both turbo forwards build their
+# variable-step schedule with min(infer_steps, 20) -- see
+# models/turbo/modeling_acestep_v15_turbo.py and
+# models/xl_turbo/modeling_acestep_v15_xl_turbo.py -- and the Gradio UI exposes
+# 1-20, so clamping lower here would deny REST callers steps the model supports.
+MAX_TURBO_INFER_STEPS = 20
+
 
 class ServiceGenerateRequestMixin:
     """Prepare normalized service-generation inputs before diffusion execution."""
@@ -49,12 +56,14 @@ class ServiceGenerateRequestMixin:
         return_intermediate: bool = False,
     ) -> Dict[str, Any]:
         """Normalize scalar/list generation inputs and clamp turbo infer steps."""
-        if self.config.is_turbo and infer_steps > 8:
+        if self.config.is_turbo and infer_steps > MAX_TURBO_INFER_STEPS:
             logger.warning(
-                "[service_generate] dmd_gan version: infer_steps {} exceeds maximum 8, clamping to 8",
+                "[service_generate] turbo model: infer_steps {} exceeds maximum {}, clamping to {}",
                 infer_steps,
+                MAX_TURBO_INFER_STEPS,
+                MAX_TURBO_INFER_STEPS,
             )
-            infer_steps = 8
+            infer_steps = MAX_TURBO_INFER_STEPS
 
         # Convert captions to list and determine batch size
         if isinstance(captions, str):
