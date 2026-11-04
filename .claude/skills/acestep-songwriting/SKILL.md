@@ -49,6 +49,40 @@ Supports multiple formats: simple style words, comma-separated tags, complex nat
    - **Fix: Repetition reinforcement** — Repeat the elements you want more
    - **Fix: Conflict to evolution** — "Start with soft strings, middle becomes metal rock, end turns to hip-hop"
 8. **Don't put BPM/key/tempo in Caption** — Use dedicated parameters instead
+9. **Word count per instrument sets its loudness** — The model balances the mix roughly in
+   proportion to how much caption you spend on each element. Three percussion words against
+   one for the bass yields drums over bass, whatever you intended.
+10. **Name what should be loudest** — Say it outright: "bass sitting loudest in the mix",
+    "vocal mixed low and close". Don't leave the balance to be inferred.
+11. **Groove genre words raise variance, not just energy** — "funk", "disco", "breakbeat"
+    and friends pull in busy syncopation and a forward backbeat. Expect wide seed-to-seed
+    swings; generate several seeds and compare rather than trusting one take.
+
+### Mix Balance
+
+Captions control relative loudness, and getting it wrong is the failure that level metrics
+miss entirely — a render can be full length, unclipped and healthy on crest factor while
+being tiring to listen to.
+
+The fatigue almost always lives in the **180–350 Hz snare body**. Energy pushed up there,
+and pulled out of the 50–120 Hz kick and bass fundamentals, is what "the beat is too loud"
+usually means in practice.
+
+What pushes percussion forward, in rough order of strength:
+
+| Pattern | Instead |
+|---|---|
+| Stacked percussion adjectives: "tight drum machine with a fat snare and crisp closed hi-hat" | One phrase: "soft dampened drum machine" |
+| Attack words anywhere: "stabs", "punchy", "crisp", "tight", "snappy" | "held long", "soft", "brushed", "muffled" |
+| Genre words implying a drum-forward idiom, repeated ("funky … funk feel") | Name the genre once, qualified: "mellow funk-tinged" |
+| Leaving the balance unstated | "drum machine tucked quietly behind the bass" |
+
+Prefer positive descriptions over negations — "soft brushed snare" works, "snare with no
+crack" does not; the model reads the noun, not the negation.
+
+**Verify before shipping.** Run `python scripts/audio_qc.py <files>` over a finished batch.
+It reports spectral balance alongside the level metrics and flags the tracks that stand out
+from their siblings, which is how a drum-forward render gets caught without a listening pass.
 
 ---
 
