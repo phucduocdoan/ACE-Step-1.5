@@ -8,6 +8,18 @@ allowed-tools: Read
 
 Professional music creation knowledge for writing captions, lyrics, and choosing music parameters for ACE-Step.
 
+## References
+
+Read these when they apply; they hold the parts that were learned the hard way.
+
+- **`references/artist-styles.md`** — decomposing a named act into instruments and
+  production. Men I Trust and Joji, with captions that have actually been rendered
+  and measured.
+- **`references/generation-checks.md`** — how to tell whether a run really did what
+  you asked. The API returns HTTP 200 on several failures that look like success.
+- **`references/playlist-mit8.sh`** — a complete eight-track set, verified reproducible.
+  Useful as a worked example of caption plus lyrics plus parameters, or to extend.
+
 ## Output Format
 
 After using this guide, produce two things for the acestep skill:
