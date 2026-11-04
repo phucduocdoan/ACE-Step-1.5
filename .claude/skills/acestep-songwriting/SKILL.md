@@ -20,6 +20,50 @@ Read these when they apply; they hold the parts that were learned the hard way.
 - **`references/playlist-mit8.sh`** — a complete eight-track set, verified reproducible.
   Useful as a worked example of caption plus lyrics plus parameters, or to extend.
 
+## Vocal or Instrumental
+
+**Default: vocal.** Write full lyrics unless the request says otherwise. Do not ask; if
+nobody said "instrumental", it is a vocal track.
+
+Switch only on an explicit word from the user — "instrumental", "no vocals", "beat",
+"background music", or the Vietnamese "khong loi" / "nhac nen".
+
+Instrumental is not a parameter. It is two changes that have to agree:
+
+| | Vocal (default) | Instrumental |
+|---|---|---|
+| Lyrics field | full lyrics under structure tags | structure tags **only**, no words |
+| Caption | name the voice, e.g. "soft breathy female vocal mixed low and close" | lead with "instrumental", remove every vocal word |
+| Arrangement | the vocal carries the melody | something else must — name it, e.g. "picked electric bass carrying the entire melody" |
+
+The empty lyrics field is what actually decides it. The caption stops the model from
+filling the space with wordless vocal anyway, and the third row stops it from leaving a
+hole where the singer used to be.
+
+A tag-only lyrics field still shapes the arrangement, so use it to score the track:
+
+```
+[Intro]
+
+[Instrumental]
+
+[Guitar Solo]
+
+[Instrumental]
+
+[Breakdown]
+
+[Outro]
+
+[Fade Out]
+```
+
+One exception to the "prefer positive descriptions" rule under **Mix Balance**: "no vocals" in the caption
+does work here, as long as the caption *opens* with "instrumental". Verified on track 06 of
+`references/playlist-mit8.sh`. It is safe only because the lyrics field is already empty.
+
+---
+
 ## Output Format
 
 After using this guide, produce two things for the acestep skill:
