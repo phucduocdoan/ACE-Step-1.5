@@ -8,6 +8,64 @@ allowed-tools: Read
 
 Professional music creation knowledge for writing captions, lyrics, and choosing music parameters for ACE-Step.
 
+## References
+
+Read these when they apply; they hold the parts that were learned the hard way.
+
+- **`references/artist-styles.md`** — decomposing a named act into instruments and
+  production. Men I Trust and Joji, with captions that have actually been rendered
+  and measured.
+- **`references/generation-checks.md`** — how to tell whether a run really did what
+  you asked. The API returns HTTP 200 on several failures that look like success.
+- **`references/playlist-mit8.sh`** — a complete eight-track set, verified reproducible.
+  Useful as a worked example of caption plus lyrics plus parameters, or to extend.
+- **`references/youtube-publishing.md`** — not songwriting: what YouTube requires when
+  the music is model-generated. AI music must be disclosed; read this before uploading.
+
+## Vocal or Instrumental
+
+**Default: vocal.** Write full lyrics unless the request says otherwise. Do not ask; if
+nobody said "instrumental", it is a vocal track.
+
+Switch only on an explicit word from the user — "instrumental", "no vocals", "beat",
+"background music", or the Vietnamese "khong loi" / "nhac nen".
+
+Instrumental is not a parameter. It is two changes that have to agree:
+
+| | Vocal (default) | Instrumental |
+|---|---|---|
+| Lyrics field | full lyrics under structure tags | structure tags **only**, no words |
+| Caption | name the voice, e.g. "soft breathy female vocal mixed low and close" | lead with "instrumental", remove every vocal word |
+| Arrangement | the vocal carries the melody | something else must — name it, e.g. "picked electric bass carrying the entire melody" |
+
+The empty lyrics field is what actually decides it. The caption stops the model from
+filling the space with wordless vocal anyway, and the third row stops it from leaving a
+hole where the singer used to be.
+
+A tag-only lyrics field still shapes the arrangement, so use it to score the track:
+
+```
+[Intro]
+
+[Instrumental]
+
+[Guitar Solo]
+
+[Instrumental]
+
+[Breakdown]
+
+[Outro]
+
+[Fade Out]
+```
+
+One exception to the "prefer positive descriptions" rule under **Mix Balance**: "no vocals" in the caption
+does work here, as long as the caption *opens* with "instrumental". Verified on track 06 of
+`references/playlist-mit8.sh`. It is safe only because the lyrics field is already empty.
+
+---
+
 ## Output Format
 
 After using this guide, produce two things for the acestep skill:
@@ -49,6 +107,43 @@ Supports multiple formats: simple style words, comma-separated tags, complex nat
    - **Fix: Repetition reinforcement** — Repeat the elements you want more
    - **Fix: Conflict to evolution** — "Start with soft strings, middle becomes metal rock, end turns to hip-hop"
 8. **Don't put BPM/key/tempo in Caption** — Use dedicated parameters instead
+9. **Word count per instrument sets its loudness** — The model balances the mix roughly in
+   proportion to how much caption you spend on each element. Three percussion words against
+   one for the bass yields drums over bass, whatever you intended.
+10. **Name what should be loudest** — Say it outright: "bass sitting loudest in the mix",
+    "vocal mixed low and close". Don't leave the balance to be inferred.
+11. **Groove genre words raise variance, not just energy** — "funk", "disco", "breakbeat"
+    and friends pull in busy syncopation and a forward backbeat. Expect wide seed-to-seed
+    swings; generate several seeds and compare rather than trusting one take.
+12. **Decompose artists, never name them** — The model does not reliably know who an act is.
+    Translate the reference into instruments, production and vocal treatment instead. Worked
+    decompositions live in `references/artist-styles.md`.
+
+### Mix Balance
+
+Captions control relative loudness, and getting it wrong is the failure that level metrics
+miss entirely — a render can be full length, unclipped and healthy on crest factor while
+being tiring to listen to.
+
+The fatigue almost always lives in the **180–350 Hz snare body**. Energy pushed up there,
+and pulled out of the 50–120 Hz kick and bass fundamentals, is what "the beat is too loud"
+usually means in practice.
+
+What pushes percussion forward, in rough order of strength:
+
+| Pattern | Instead |
+|---|---|
+| Stacked percussion adjectives: "tight drum machine with a fat snare and crisp closed hi-hat" | One phrase: "soft dampened drum machine" |
+| Attack words anywhere: "stabs", "punchy", "crisp", "tight", "snappy" | "held long", "soft", "brushed", "muffled" |
+| Genre words implying a drum-forward idiom, repeated ("funky … funk feel") | Name the genre once, qualified: "mellow funk-tinged" |
+| Leaving the balance unstated | "drum machine tucked quietly behind the bass" |
+
+Prefer positive descriptions over negations — "soft brushed snare" works, "snare with no
+crack" does not; the model reads the noun, not the negation.
+
+**Verify before shipping.** Run `python scripts/audio_qc.py <files>` over a finished batch.
+It reports spectral balance alongside the level metrics and flags the tracks that stand out
+from their siblings, which is how a drum-forward render gets caught without a listening pass.
 
 ---
 
