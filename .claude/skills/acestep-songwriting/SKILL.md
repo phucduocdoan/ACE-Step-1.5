@@ -19,6 +19,8 @@ Read these when they apply; they hold the parts that were learned the hard way.
   you asked. The API returns HTTP 200 on several failures that look like success.
 - **`references/playlist-mit8.sh`** — a complete eight-track set, verified reproducible.
   Useful as a worked example of caption plus lyrics plus parameters, or to extend.
+- **`references/youtube-publishing.md`** — not songwriting: what YouTube requires when
+  the music is model-generated. AI music must be disclosed; read this before uploading.
 
 ## Vocal or Instrumental
 
