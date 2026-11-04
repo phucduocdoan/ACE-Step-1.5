@@ -57,6 +57,9 @@ Supports multiple formats: simple style words, comma-separated tags, complex nat
 11. **Groove genre words raise variance, not just energy** — "funk", "disco", "breakbeat"
     and friends pull in busy syncopation and a forward backbeat. Expect wide seed-to-seed
     swings; generate several seeds and compare rather than trusting one take.
+12. **Decompose artists, never name them** — The model does not reliably know who an act is.
+    Translate the reference into instruments, production and vocal treatment instead. Worked
+    decompositions live in `references/artist-styles.md`.
 
 ### Mix Balance
 
