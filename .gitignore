@@ -267,3 +267,5 @@ package-lock.json
 api_server.pid
 api_outputs/
 run_local_*.sh
+# YouTube OAuth client secret + token for the music-video uploader
+.youtube/
