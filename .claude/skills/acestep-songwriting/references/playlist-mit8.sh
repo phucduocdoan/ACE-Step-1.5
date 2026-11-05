@@ -12,7 +12,7 @@
 #
 # Track 05 uses the second-pass caption. The first version said "funky dream
 # pop ... tight drum machine ... laid-back funk feel" and landed 39% of its
-# energy in the 180-350 Hz snare body - audibly fatiguing. See artist-styles.md,
+# energy in the 180-350 Hz snare body - audibly fatiguing. See styles/men-i-trust.md,
 # "do not reach for funk".
 #
 # Usage:

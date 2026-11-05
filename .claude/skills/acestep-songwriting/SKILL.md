@@ -12,15 +12,18 @@ Professional music creation knowledge for writing captions, lyrics, and choosing
 
 Read these when they apply; they hold the parts that were learned the hard way.
 
-- **`references/artist-styles.md`** — decomposing a named act into instruments and
-  production. Men I Trust and Joji, with captions that have actually been rendered
-  and measured.
+- **`references/styles/`** — one pattern sheet per style, decomposing a named act into
+  instruments, production and vocal treatment. Start at `references/styles/README.md`: it indexes
+  the sheets, says which have actually been rendered and measured, and holds the
+  template for adding a new one.
 - **`references/generation-checks.md`** — how to tell whether a run really did what
   you asked. The API returns HTTP 200 on several failures that look like success.
 - **`references/playlist-mit8.sh`** — a complete eight-track set, verified reproducible.
   Useful as a worked example of caption plus lyrics plus parameters, or to extend.
-- **`references/youtube-publishing.md`** — not songwriting: what YouTube requires when
-  the music is model-generated. AI music must be disclosed; read this before uploading.
+  `references/playlist-mit8-vi.sh` is the same set with Vietnamese lyrics.
+
+Publishing is a separate skill. Once a track is finished, `acestep-publishing` covers
+what YouTube requires for model-generated music and how to write the metadata.
 
 ## Vocal or Instrumental
 
@@ -117,7 +120,7 @@ Supports multiple formats: simple style words, comma-separated tags, complex nat
     swings; generate several seeds and compare rather than trusting one take.
 12. **Decompose artists, never name them** — The model does not reliably know who an act is.
     Translate the reference into instruments, production and vocal treatment instead. Worked
-    decompositions live in `references/artist-styles.md`.
+    decompositions live in `references/styles/`.
 
 ### Mix Balance
 
