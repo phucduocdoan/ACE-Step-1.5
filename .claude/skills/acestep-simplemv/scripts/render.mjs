@@ -302,6 +302,7 @@ const inputProps = {
   durationInSeconds: duration,
   lyricOffset: args.offset ? parseFloat(args.offset) : -0.5,
   backgroundImage,
+  minimal: args.style === 'minimal',
 };
 
 const output = args.output ? resolveFilePath(args.output) : 'out/video.mp4';
@@ -343,6 +344,7 @@ console.log(`  Lyrics: ${lyrics.length} lines`);
 console.log(`  Output: ${output}`);
 console.log(`  Codec: ${codec}`);
 if (backgroundImage) console.log(`  Background: ${backgroundImage}`);
+if (inputProps.minimal) console.log(`  Style: minimal (no bars, no neon)`);
 if (browserExe) console.log(`  Browser: ${browserExe}`);
 if (chromeMode !== 'headless-shell') console.log(`  Chrome mode: ${chromeMode}`);
 console.log('');

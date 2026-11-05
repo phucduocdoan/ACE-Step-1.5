@@ -20,6 +20,7 @@ export const AudioVisualization: React.FC<MVInputProps> = ({
   creditText,
   lyricOffset,
   backgroundImage,
+  minimal,
 }) => {
   const frame = useCurrentFrame();
   const {fps, durationInFrames} = useVideoConfig();
@@ -73,6 +74,9 @@ export const AudioVisualization: React.FC<MVInputProps> = ({
   const avgAmplitude =
     visualization.reduce((sum, val) => sum + val, 0) / visualization.length;
 
+  // In minimal mode the cycling rainbow is replaced by a fixed warm amber.
+  const accentHue = minimal ? 38 : hue;
+
   const bgSrc = backgroundImage
     ? backgroundImage.startsWith('http')
       ? backgroundImage
@@ -97,7 +101,7 @@ export const AudioVisualization: React.FC<MVInputProps> = ({
           {/* Dark overlay for readability */}
           <AbsoluteFill
             style={{
-              background: `rgba(0, 0, 0, 0.45)`,
+              background: `rgba(0, 0, 0, ${minimal ? 0 : 0.45})`,
             }}
           />
         </>
@@ -112,177 +116,186 @@ export const AudioVisualization: React.FC<MVInputProps> = ({
       )}
 
       {/* Radial glow effect */}
-      <AbsoluteFill
-        style={{
-          background: `radial-gradient(circle at 50% 50%, hsla(${hue}, 100%, 50%, ${avgAmplitude * 0.3}) 0%, transparent 50%)`,
-        }}
-      />
+      {!minimal && (
+        <AbsoluteFill
+          style={{
+            background: `radial-gradient(circle at 50% 50%, hsla(${hue}, 100%, 50%, ${avgAmplitude * 0.3}) 0%, transparent 50%)`,
+          }}
+        />
+      )}
 
       {/* Audio source */}
       <Audio src={audioSrc} />
 
-      {/* Bottom frequency bars */}
-      <AbsoluteFill
-        style={{
-          justifyContent: 'flex-end',
-          alignItems: 'center',
-        }}
-      >
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'flex-end',
-            justifyContent: 'center',
-            gap: 4,
-            height: 350,
-            width: '90%',
-            marginBottom: 180,
-          }}
-        >
-          {visualization.map((value, index) => {
-            const scaledValue = Math.pow(value, 0.6);
-            const barHeight = Math.max(scaledValue * 800, 20);
-            const colorIndex = (index / visualization.length) * 360;
+      {!minimal && (
+        <>
+          {/* Bottom frequency bars */}
+          <AbsoluteFill
+            style={{
+              justifyContent: 'flex-end',
+              alignItems: 'center',
+            }}
+          >
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'flex-end',
+                justifyContent: 'center',
+                gap: 4,
+                height: 350,
+                width: '90%',
+                marginBottom: 180,
+              }}
+            >
+              {visualization.map((value, index) => {
+                const scaledValue = Math.pow(value, 0.6);
+                const barHeight = Math.max(scaledValue * 800, 20);
+                const colorIndex = (index / visualization.length) * 360;
 
-            return (
-              <div
-                key={index}
-                style={{
-                  width: `${100 / visualization.length}%`,
-                  height: barHeight,
-                  background: `linear-gradient(to top,
-                    hsl(${(colorIndex + hue) % 360}, 90%, 60%),
-                    hsl(${(colorIndex + hue + 40) % 360}, 90%, 70%))`,
-                  borderRadius: '4px 4px 0 0',
-                  boxShadow: `0 0 ${10 + scaledValue * 30}px hsla(${(colorIndex + hue) % 360}, 100%, 60%, ${scaledValue})`,
-                  transition: 'height 0.05s ease-out',
-                }}
-              />
-            );
-          })}
-        </div>
-      </AbsoluteFill>
+                return (
+                  <div
+                    key={index}
+                    style={{
+                      width: `${100 / visualization.length}%`,
+                      height: barHeight,
+                      background: `linear-gradient(to top,
+                        hsl(${(colorIndex + hue) % 360}, 90%, 60%),
+                        hsl(${(colorIndex + hue + 40) % 360}, 90%, 70%))`,
+                      borderRadius: '4px 4px 0 0',
+                      boxShadow: `0 0 ${10 + scaledValue * 30}px hsla(${(colorIndex + hue) % 360}, 100%, 60%, ${scaledValue})`,
+                      transition: 'height 0.05s ease-out',
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </AbsoluteFill>
 
-      {/* Symmetrical side bars */}
-      <AbsoluteFill
-        style={{
-          justifyContent: 'center',
-          alignItems: 'center',
-        }}
-      >
-        {/* Left bars */}
-        <div
-          style={{
-            position: 'absolute',
-            left: 40,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 8,
-            height: '80%',
-            justifyContent: 'space-around',
-          }}
-        >
-          {visualization.slice(0, 20).map((value, index) => {
-            const scaledValue = Math.pow(value, 0.6);
-            const barWidth = Math.max(scaledValue * 300, 10);
-            const colorIndex = (index / 20) * 360;
-            return (
-              <div
-                key={index}
-                style={{
-                  width: barWidth,
-                  height: 12,
-                  background: `linear-gradient(to right,
-                    hsl(${(colorIndex + hue) % 360}, 90%, 60%),
-                    hsl(${(colorIndex + hue + 40) % 360}, 90%, 70%))`,
-                  borderRadius: '0 6px 6px 0',
-                  boxShadow: `0 0 ${10 + scaledValue * 20}px hsla(${(colorIndex + hue) % 360}, 100%, 60%, ${scaledValue})`,
-                }}
-              />
-            );
-          })}
-        </div>
+          {/* Symmetrical side bars */}
+          <AbsoluteFill
+            style={{
+              justifyContent: 'center',
+              alignItems: 'center',
+            }}
+          >
+            {/* Left bars */}
+            <div
+              style={{
+                position: 'absolute',
+                left: 40,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 8,
+                height: '80%',
+                justifyContent: 'space-around',
+              }}
+            >
+              {visualization.slice(0, 20).map((value, index) => {
+                const scaledValue = Math.pow(value, 0.6);
+                const barWidth = Math.max(scaledValue * 300, 10);
+                const colorIndex = (index / 20) * 360;
+                return (
+                  <div
+                    key={index}
+                    style={{
+                      width: barWidth,
+                      height: 12,
+                      background: `linear-gradient(to right,
+                        hsl(${(colorIndex + hue) % 360}, 90%, 60%),
+                        hsl(${(colorIndex + hue + 40) % 360}, 90%, 70%))`,
+                      borderRadius: '0 6px 6px 0',
+                      boxShadow: `0 0 ${10 + scaledValue * 20}px hsla(${(colorIndex + hue) % 360}, 100%, 60%, ${scaledValue})`,
+                    }}
+                  />
+                );
+              })}
+            </div>
 
-        {/* Right bars */}
-        <div
-          style={{
-            position: 'absolute',
-            right: 40,
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 8,
-            height: '80%',
-            justifyContent: 'space-around',
-            alignItems: 'flex-end',
-          }}
-        >
-          {visualization.slice(0, 20).map((value, index) => {
-            const scaledValue = Math.pow(value, 0.6);
-            const barWidth = Math.max(scaledValue * 300, 10);
-            const colorIndex = (index / 20) * 360;
-            return (
-              <div
-                key={index}
-                style={{
-                  width: barWidth,
-                  height: 12,
-                  background: `linear-gradient(to left,
-                    hsl(${(colorIndex + hue + 180) % 360}, 90%, 60%),
-                    hsl(${(colorIndex + hue + 220) % 360}, 90%, 70%))`,
-                  borderRadius: '6px 0 0 6px',
-                  boxShadow: `0 0 ${10 + scaledValue * 20}px hsla(${(colorIndex + hue + 180) % 360}, 100%, 60%, ${scaledValue})`,
-                }}
-              />
-            );
-          })}
-        </div>
-      </AbsoluteFill>
+            {/* Right bars */}
+            <div
+              style={{
+                position: 'absolute',
+                right: 40,
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 8,
+                height: '80%',
+                justifyContent: 'space-around',
+                alignItems: 'flex-end',
+              }}
+            >
+              {visualization.slice(0, 20).map((value, index) => {
+                const scaledValue = Math.pow(value, 0.6);
+                const barWidth = Math.max(scaledValue * 300, 10);
+                const colorIndex = (index / 20) * 360;
+                return (
+                  <div
+                    key={index}
+                    style={{
+                      width: barWidth,
+                      height: 12,
+                      background: `linear-gradient(to left,
+                        hsl(${(colorIndex + hue + 180) % 360}, 90%, 60%),
+                        hsl(${(colorIndex + hue + 220) % 360}, 90%, 70%))`,
+                      borderRadius: '6px 0 0 6px',
+                      boxShadow: `0 0 ${10 + scaledValue * 20}px hsla(${(colorIndex + hue + 180) % 360}, 100%, 60%, ${scaledValue})`,
+                    }}
+                  />
+                );
+              })}
+            </div>
+          </AbsoluteFill>
+        </>
+      )}
 
-      {/* Center title area */}
-      <AbsoluteFill
-        style={{
-          justifyContent: 'flex-start',
-          alignItems: 'center',
-          paddingTop: 60,
-        }}
-      >
-        <div
+      {/* Center title area. In minimal style the frame carries no type at all --
+          the title lives on the thumbnail instead. */}
+      {!minimal && (
+        <AbsoluteFill
           style={{
-            textAlign: 'center',
-            transform: `scale(${1 + avgAmplitude * 0.1})`,
-            transition: 'transform 0.1s ease-out',
+            justifyContent: 'flex-start',
+            alignItems: 'center',
+            paddingTop: 60,
           }}
         >
           <div
             style={{
-              fontSize: 96,
-              fontWeight: 'bold',
-              color: 'white',
-              opacity: titleOpacity,
-              transform: `translateY(${titleY}px)`,
-              textShadow: `0 0 40px hsla(${hue}, 100%, 70%, 0.8), 0 4px 20px rgba(0,0,0,0.5)`,
-              fontFamily: '"Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC", "Noto Sans CJK KR", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback", "Source Han Sans SC", "Microsoft YaHei", "SimHei", "Hiragino Sans GB", Arial, Helvetica, sans-serif',
-              marginBottom: 10,
+              textAlign: 'center',
+              transform: minimal ? 'none' : `scale(${1 + avgAmplitude * 0.1})`,
+              transition: 'transform 0.1s ease-out',
             }}
           >
-            {title}
+            <div
+              style={{
+                fontSize: 96,
+                fontWeight: 'bold',
+                color: 'white',
+                opacity: titleOpacity,
+                transform: `translateY(${titleY}px)`,
+                textShadow: `0 0 40px hsla(${accentHue}, 100%, 70%, 0.8), 0 4px 20px rgba(0,0,0,0.5)`,
+                fontFamily: '"Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC", "Noto Sans CJK KR", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback", "Source Han Sans SC", "Microsoft YaHei", "SimHei", "Hiragino Sans GB", Arial, Helvetica, sans-serif',
+                marginBottom: 10,
+              }}
+            >
+              {title}
+            </div>
+            <div
+              style={{
+                fontSize: 56,
+                fontWeight: '600',
+                color: 'rgba(255,255,255,0.95)',
+                opacity: titleOpacity,
+                transform: `translateY(${titleY}px)`,
+                textShadow: `0 0 30px hsla(${accentHue + 60}, 100%, 70%, 0.6), 0 2px 10px rgba(0,0,0,0.5)`,
+                fontFamily: '"Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC", "Noto Sans CJK KR", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback", "Source Han Sans SC", "Microsoft YaHei", "SimHei", "Hiragino Sans GB", Arial, Helvetica, sans-serif',
+                letterSpacing: '4px',
+              }}
+            >
+              {subtitle}
+            </div>
           </div>
-          <div
-            style={{
-              fontSize: 56,
-              fontWeight: '600',
-              color: 'rgba(255,255,255,0.95)',
-              opacity: titleOpacity,
-              transform: `translateY(${titleY}px)`,
-              textShadow: `0 0 30px hsla(${hue + 60}, 100%, 70%, 0.6), 0 2px 10px rgba(0,0,0,0.5)`,
-              fontFamily: '"Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC", "Noto Sans CJK KR", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback", "Source Han Sans SC", "Microsoft YaHei", "SimHei", "Hiragino Sans GB", Arial, Helvetica, sans-serif',
-              letterSpacing: '4px',
-            }}
-          >
-            {subtitle}
-          </div>
-        </div>
-      </AbsoluteFill>
+        </AbsoluteFill>
+      )}
 
       {/* Lyrics display */}
       {currentLyric && currentLyric.text && (
@@ -302,15 +315,15 @@ export const AudioVisualization: React.FC<MVInputProps> = ({
               maxWidth: '85%',
               opacity: lyricProgress,
               transform: `translateY(${(1 - lyricProgress) * 30}px)`,
-              textShadow: `0 0 40px hsla(${hue}, 100%, 70%, 0.8), 0 4px 30px rgba(0,0,0,0.9)`,
+              textShadow: `0 0 40px hsla(${accentHue}, 100%, 70%, 0.8), 0 4px 30px rgba(0,0,0,0.9)`,
               fontFamily: '"Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC", "Noto Sans CJK KR", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback", "Source Han Sans SC", "Microsoft YaHei", "SimHei", "Hiragino Sans GB", Arial, Helvetica, sans-serif',
               lineHeight: 1.5,
               padding: '25px 50px',
               background: `linear-gradient(135deg, rgba(0,0,0,0.4), rgba(0,0,0,0.2))`,
               backdropFilter: 'blur(15px)',
               borderRadius: '20px',
-              border: `2px solid hsla(${hue}, 80%, 60%, 0.3)`,
-              boxShadow: `0 8px 32px rgba(0,0,0,0.5), inset 0 0 40px hsla(${hue}, 100%, 50%, 0.1)`,
+              border: `2px solid hsla(${accentHue}, 80%, 60%, 0.3)`,
+              boxShadow: `0 8px 32px rgba(0,0,0,0.5), inset 0 0 40px hsla(${accentHue}, 100%, 50%, 0.1)`,
             }}
           >
             {currentLyric.text}
@@ -319,27 +332,29 @@ export const AudioVisualization: React.FC<MVInputProps> = ({
       )}
 
       {/* Bottom credit text */}
-      <AbsoluteFill
-        style={{
-          justifyContent: 'flex-end',
-          alignItems: 'center',
-          padding: 50,
-        }}
-      >
-        <div
+      {!minimal && (
+        <AbsoluteFill
           style={{
-            fontSize: 32,
-            fontWeight: '500',
-            color: 'white',
-            opacity: 0.8,
-            textAlign: 'center',
-            textShadow: `0 0 20px hsla(${hue}, 100%, 70%, 0.6), 0 2px 10px rgba(0,0,0,0.7)`,
-            fontFamily: '"Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC", "Noto Sans CJK KR", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback", "Source Han Sans SC", "Microsoft YaHei", "SimHei", "Hiragino Sans GB", Arial, Helvetica, sans-serif',
+            justifyContent: 'flex-end',
+            alignItems: 'center',
+            padding: 50,
           }}
         >
-          {creditText}
-        </div>
-      </AbsoluteFill>
+          <div
+            style={{
+              fontSize: 32,
+              fontWeight: '500',
+              color: 'white',
+              opacity: 0.8,
+              textAlign: 'center',
+              textShadow: `0 0 20px hsla(${accentHue}, 100%, 70%, 0.6), 0 2px 10px rgba(0,0,0,0.7)`,
+              fontFamily: '"Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK TC", "Noto Sans CJK KR", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback", "Source Han Sans SC", "Microsoft YaHei", "SimHei", "Hiragino Sans GB", Arial, Helvetica, sans-serif',
+            }}
+          >
+            {creditText}
+          </div>
+        </AbsoluteFill>
+      )}
     </AbsoluteFill>
   );
 };

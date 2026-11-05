@@ -21,6 +21,8 @@ export interface MVInputProps extends Record<string, unknown> {
   lyricOffset: number;
   /** Background image filename (relative to public/ or absolute URL). If empty, uses animated gradient. */
   backgroundImage: string;
+  /** Minimal look: no EQ bars, no neon glow, no beat pulse. Lets the artwork carry the frame. */
+  minimal: boolean;
 }
 
 export const defaultProps: MVInputProps = {
@@ -32,4 +34,5 @@ export const defaultProps: MVInputProps = {
   durationInSeconds: 150,
   lyricOffset: -0.5,
   backgroundImage: '',
+  minimal: false,
 };
